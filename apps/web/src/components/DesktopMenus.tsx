@@ -209,7 +209,7 @@ export function MenuBarActions({ orgId }: { orgId: string }) {
     void thisMac.orgs(orgList).catch(() => {});
   }, [orgsKey]);
 
-  // The Dock's badge: what waits on the person in this organization (a dot for unread only).
+  // The Dock's badge: how many notifications in this organization are unread or wait on the person.
   const counts = useNotificationCount(orgId).data;
   const waiting = counts?.waiting ?? 0;
   const unread = counts?.unread ?? 0;
