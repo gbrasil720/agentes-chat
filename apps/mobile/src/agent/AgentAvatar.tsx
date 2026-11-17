@@ -2,6 +2,7 @@ import {
   bodyTones,
   drawAccessory,
   drawAgent,
+  drawnKey,
   drawSleep,
   type Expression,
   EYE_COLOR,
@@ -41,6 +42,8 @@ export interface AgentAvatarProps {
   gaze?: Gaze;
   /** Only its sky, no body (framed only): out on a routine, it comes back into the frame when the run ends. */
   bodyless?: boolean;
+  /** The tile's corner (framed only). Default 30% of the side; `size / 2` inside a fully round pill. */
+  radius?: number;
 }
 
 /** Up or down the screen. */
@@ -115,6 +118,7 @@ function AgentAvatarView({
   expression,
   gaze,
   bodyless = false,
+  radius,
 }: AgentAvatarProps) {
   const reduced = useReducedMotion();
   const { scheme, colors: c } = useTheme();
@@ -124,6 +128,9 @@ function AgentAvatarView({
   const { color, eyes, accessory, id } = agent;
   const seed = useMemo(() => seedOf(id ?? `${color}:${eyes}:${accessory ?? ""}`), [id, color, eyes, accessory]);
   const t = useFrameTime(live && !reduced, STILL_T);
+  // By the colors it resolves to: `sky` follows the workspace's accent.
+  const drawn = drawnKey(color);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `drawn` is what `color` draws as now
   const picture = useMemo(() => {
     const frame = agentFrame(
       { color, eyes, accessory },
@@ -138,7 +145,7 @@ function AgentAvatarView({
       { gaze, bodyless },
     );
     return createPicture((canvas) => replay(canvas, frame), { width: size, height: size });
-  }, [color, eyes, accessory, size, mode, t, seed, reduced, tile, dark, expression, gaze, bodyless]);
+  }, [color, drawn, eyes, accessory, size, mode, t, seed, reduced, tile, dark, expression, gaze, bodyless]);
   const label = name
     ? tr(mode === "run" ? "mobile.a11y.agentWorking" : "mobile.a11y.agent", { name })
     : tr("mobile.a11y.agentPlain");
@@ -150,7 +157,7 @@ function AgentAvatarView({
       style={[
         { width: size, height: size },
         tile && {
-          borderRadius: size * 0.3,
+          borderRadius: radius ?? size * 0.3,
           overflow: "hidden",
           borderWidth: StyleSheet.hairlineWidth,
           borderColor: c.line,
@@ -180,6 +187,7 @@ export const AgentAvatar = memo(
     a.expression === b.expression &&
     a.gaze === b.gaze &&
     a.bodyless === b.bodyless &&
+    a.radius === b.radius &&
     a.agent.color === b.agent.color &&
     a.agent.eyes === b.agent.eyes &&
     a.agent.accessory === b.agent.accessory &&

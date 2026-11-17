@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { MACHINE_PROTOCOL_VERSION, userTopic } from "@agenteschat/adapters";
 import { and, eq, schema } from "@agenteschat/db";
-import { extraUsageLeft, extraUsageOn, planBinding } from "@agenteschat/ui/plan-state";
+import { extraUsageLeft, planBinding } from "@agenteschat/ui/plan-state";
 import {
   addChannelMember,
   answerNow,
@@ -79,9 +79,7 @@ test("the window that binds long work: live, of this model, never extra usage", 
   expect(planBinding(old, { now })).toBeNull();
   expect(planBinding(reading([{ kind: "five_hour", usedPercent: 96 }]), { now })?.used).toBe(96);
   expect(planBinding(null)).toBeNull();
-  expect(extraUsageOn(u)).toBe(true);
-  expect(extraUsageOn(reading([{ kind: "five_hour", usedPercent: 1 }]))).toBe(false);
-  // Extra usage whose own cap is spent leaves long work nothing to go on into; the switch still shows.
+  // Extra usage whose own cap is spent leaves long work nothing to go on into.
   expect(extraUsageLeft(u)).toBe(false);
   expect(extraUsageLeft(reading([{ kind: "other", label: "Extra usage", usedPercent: 140 }]))).toBe(false);
   expect(extraUsageLeft(reading([{ kind: "other", label: "Extra usage", usedPercent: 10 }]))).toBe(true);
@@ -221,6 +219,30 @@ test("Continuar agora: who may press it lets the run go on once; a person's mess
   expect(audit).toHaveLength(1);
 });
 
+test("Continuar agora from outside the card's conversation: the run's people may, nobody else", async () => {
+  // The card of a run that answers another agent sits in the agents' DM, which no person is a member of.
+  f = await setup({ contextTools: true, budgetNanoUsd: BUDGET, reply: stepper(12) });
+  await spend(f, 96);
+  await post(f, "@dev analisa os pedidos");
+  await drainOutbox(f.db, f.handlers);
+  const [paused] = await runs(f);
+  const [card] = await cards(f);
+  if (!card || !paused) throw new Error("no card");
+  const deps = { db: f.db, pubsub: f.pubsub, gateway: f.gateway };
+  // Neither is a member of the conversation; one owns the agent.
+  const bia = await addMember(f.db, f.org.id, "member", "bia");
+  const caio = await addMember(f.db, f.org.id, "member", "caio");
+  await f.db.update(schema.agents).set({ ownerUserId: bia.id }).where(eq(schema.agents.id, f.agent.id));
+
+  const refused = await answerNow(deps, caio.id, f.org.id, card.id).catch((e) => e);
+  expect((refused as { code?: string }).code).toBe("run.answer_forbidden");
+  expect(await answerNow(deps, bia.id, f.org.id, card.id)).toEqual({
+    runs: [{ agentId: f.agent.id, runId: paused.id }],
+  });
+  const [after] = await cards(f);
+  expect(after?.meta.actionCard).toEqual(expect.objectContaining({ state: "continued", continuedByUserId: bia.id }));
+});
+
 test("a person's message during a pause is answered by a run of its own", async () => {
   f = await setup({
     contextTools: true,
@@ -264,7 +286,7 @@ async function computerAgent(fx: Fixture, over: Partial<typeof schema.agents.$in
   const paired = await pairMachine(deps, fx.owner.id, fx.org.id, { name: "MacBook", ...RUNNER, exec: true });
   await fx.db
     .update(schema.agents)
-    .set({ machineId: paired.machineId, brain: "claude_code", brainFallback: false, ...over })
+    .set({ machineId: paired.machineId, brain: "claude_code", ...over })
     .where(eq(schema.agents.id, fx.agent.id));
   return paired.machineId;
 }
@@ -369,7 +391,7 @@ test("a paused slot goes on once a newer reading puts its plan back under the pa
   expect((await runs(f))[0]?.status).toBe("done");
 });
 
-test("the plan's paid extra usage lets long work go on, unless its switch is off", async () => {
+test("the plan's paid extra usage lets long work go on, never on someone else's plan lent to the agent", async () => {
   f = await setup();
   const machineId = await computerAgent(f);
   await storeOwnUsage(
@@ -386,7 +408,7 @@ test("the plan's paid extra usage lets long work go on, unless its switch is off
   await drainOutbox(f.db, handlers);
   expect(seen).toHaveLength(1);
 
-  await f.db.update(schema.agents).set({ brainExtraUsage: false }).where(eq(schema.agents.id, f.agent.id));
+  await f.db.update(schema.agents).set({ brainAccountLentBy: f.owner.id }).where(eq(schema.agents.id, f.agent.id));
   await scheduledSlot(f);
   await drainOutbox(f.db, handlers);
   expect(seen).toHaveLength(1);
@@ -744,14 +766,15 @@ test("Rotinas shows a routine's paused slot until its reset; Continuar agora for
 });
 
 /**
- * A slot of a routine paused at `percent` of its plan, on an agent whose long work keeps off paid extra usage (or,
- * with `extraUsage`, may use it but the plan's extra usage window is at `extraUsed`; null: the plan reports none).
+ * A slot of a routine paused at `percent` of its plan, on an agent whose long work keeps off paid extra usage, as on
+ * someone else's plan lent to it (or, with `extraUsage`, its owner's own plan, whose extra usage window is at
+ * `extraUsed`; null: the plan reports none).
  */
 async function pausedExtraOff(
   percent: number,
   { extraUsage = false, extraUsed = 10 as number | null }: { extraUsage?: boolean; extraUsed?: number | null } = {},
 ) {
-  const machineId = await computerAgent(f, { brainExtraUsage: extraUsage });
+  const machineId = await computerAgent(f, extraUsage ? {} : { brainAccountLentBy: f.owner.id });
   const usage = (used: number) =>
     reading([
       { kind: "five_hour", usedPercent: used, resetsAt: iso(3600_000) },
@@ -777,7 +800,7 @@ test("with extra usage off, Continuar agora goes on up to the plan's own allowan
   expect(seen).toHaveLength(0);
   expect((await getRoutineView(f.db, f.owner.id, f.org.id, id)).usagePause?.extraOff).toBe(false);
 
-  // The plan's window is used up meanwhile: going on would be paid extra usage, which this agent's switch keeps off.
+  // The plan's window is used up meanwhile: going on would be paid extra usage, which a lent plan never pays.
   await setUsage(100);
   expect((await getRoutineView(f.db, f.owner.id, f.org.id, id)).usagePause?.extraOff).toBe(true);
   const refused = await continueRoutineUsagePause({ db: f.db }, f.owner.id, f.org.id, id).catch((e) => e);
@@ -819,7 +842,7 @@ test("with extra usage off, Continuar agora goes on up to the plan's own allowan
   expect(seen).toHaveLength(1);
 });
 
-test("with the extra-usage switch on but no extra usage left, Continuar agora past the plan is refused for that reason, not the switch", async () => {
+test("on the owner's own plan with no extra usage left, Continuar agora past the plan is refused for that reason", async () => {
   f = await setup();
   const { id, setUsage } = await pausedExtraOff(97, { extraUsage: true, extraUsed: null });
   expect((await getRoutineView(f.db, f.owner.id, f.org.id, id)).state).toBe("usage_paused");

@@ -1,6 +1,7 @@
 import type { AiAccounts as AiAccountsView } from "@agenteschat/client";
 import { keys, useAiAccounts, useAiStatus, useApi, useMachines } from "@agenteschat/client";
 import {
+  accountTitle,
   agentsToGive,
   endsOnClaude,
   groupPlans,
@@ -35,6 +36,7 @@ import { useDirectory } from "@/hooks/useDirectory";
 import { useToast } from "@/lib/toast";
 import { AddAccount } from "./AddAccountFlow";
 import { PlanHold, usePlanHold } from "./ConnectAiSteps";
+import { UseKeyForAll } from "./UseKeyForAll";
 
 /*
  * What the owner of a plan account does with it (ADR 0059), where Configurações › IA e uso opens the account: what its
@@ -43,7 +45,7 @@ import { PlanHold, usePlanHold } from "./ConnectAiSteps";
  */
 
 type Row = AiAccountsView["accounts"][number];
-type Open = { type: "rename" | "again" | "remove"; account: PlanAccount<Row> };
+type Open = { type: "rename" | "again" | "remove" | "all"; account: PlanAccount<Row> };
 
 /** The viewer's own account's notes and actions, by one of its logins; nothing for an account that isn't theirs. */
 export function AccountActions({ machineId, accountId }: { machineId: string; accountId: string }) {
@@ -76,7 +78,7 @@ export function AccountActions({ machineId, accountId }: { machineId: string; ac
     setBusy(true);
     try {
       await api.agents.setBrain(org.id, agent.id, { brain: a.kind, account: a.id });
-      toast.show(t("aiAccounts.done.savedAgent", { agent: agent.name, label: a.label }));
+      toast.show(t("aiAccounts.done.savedAgent", { agent: agent.name, label: accountTitle(t, a) }));
       refetch();
       for (const key of [keys.agents(org.id), keys.aiStatus(org.id), keys.agentBrain(org.id, agent.id)])
         void qc.invalidateQueries({ queryKey: key });
@@ -164,6 +166,11 @@ export function AccountActions({ machineId, accountId }: { machineId: string; ac
             </Menu>
           )
         )}
+        {plan && a.status === "active" && (
+          <Button variant="link" disabled={busy} onClick={() => setOpen({ type: "all", account })}>
+            {t("aiAccounts.page.useAll")}
+          </Button>
+        )}
         <Button variant="link" disabled={busy} onClick={() => setOpen({ type: "rename", account })}>
           {t("aiAccounts.page.rename")}
         </Button>
@@ -191,6 +198,7 @@ export function AccountActions({ machineId, accountId }: { machineId: string; ac
         </Button>
       </div>
 
+      {open?.type === "all" && <UseKeyForAll account={a} onClose={() => setOpen(null)} />}
       {open?.type === "rename" && open.account.logins[0] && (
         <RenameDialog
           account={open.account.logins[0]}
@@ -217,7 +225,7 @@ export function AccountActions({ machineId, accountId }: { machineId: string; ac
         <Dialog
           open
           onOpenChange={(o) => !o && !busy && setOpen(null)}
-          title={t("aiAccounts.page.disconnectTitle", { label: a.label })}
+          title={t("aiAccounts.page.disconnectTitle", { label: accountTitle(t, a) })}
           description={[
             account.usedBy.length > 0
               ? t("aiAccounts.page.disconnectAgents", {
@@ -246,7 +254,7 @@ export function AccountActions({ machineId, accountId }: { machineId: string; ac
               variant="danger"
               loading={busy}
               disabled={busy}
-              onClick={() => void remove(logins, t("aiAccounts.page.disconnected", { label: a.label }))}
+              onClick={() => void remove(logins, t("aiAccounts.page.disconnected", { label: accountTitle(t, a) }))}
             >
               {t("aiAccounts.page.disconnect")}
             </Button>
@@ -280,7 +288,13 @@ function AgainDialog({
   const key = isPlanId(a.provider);
   const fanOut = key ? account.logins.map((l) => ({ id: l.id, again: l.id })) : undefined;
   return (
-    <Dialog open onOpenChange={(o) => !o && onClose()} title={a.label} closeLabel={t("common.close")} width={520}>
+    <Dialog
+      open
+      onOpenChange={(o) => !o && onClose()}
+      title={accountTitle(t, a)}
+      closeLabel={t("common.close")}
+      width={520}
+    >
       <DialogBody>
         {hold ? (
           <PlanHold hold={hold} />
@@ -319,14 +333,16 @@ function RenameDialog({
   const { org } = useOrg();
   const api = useApi();
   const toast = useToast();
-  const [label, setLabel] = useState(account.label);
+  // The automatic name ("Claude 2") is no name of theirs: the field starts empty, showing the email.
+  const given = account.named === true ? account.label : "";
+  const [label, setLabel] = useState(given);
   const [busy, setBusy] = useState(false);
   const name = label.trim();
   return (
     <Dialog
       open
       onOpenChange={(o) => !o && onClose()}
-      title={t("aiAccounts.page.renameTitle", { label: account.label })}
+      title={t("aiAccounts.page.renameTitle", { label: accountTitle(t, account) })}
       closeLabel={t("common.close")}
       width={420}
     >
@@ -354,13 +370,18 @@ function RenameDialog({
                 text: t("aiAccounts.done.name"),
               }}
             >
-              <Input value={label} maxLength={40} onChange={(e) => setLabel(e.target.value)} />
+              <Input
+                value={label}
+                maxLength={40}
+                placeholder={account.email ?? t("aiAccounts.rename.placeholder")}
+                onChange={(e) => setLabel(e.target.value)}
+              />
             </Field>
           </DialogBody>
         </Locked>
         <DialogFooter>
           <Button onClick={onClose}>{t("common.cancel")}</Button>
-          <Button type="submit" variant="primary" loading={busy} disabled={!name || name === account.label}>
+          <Button type="submit" variant="primary" loading={busy} disabled={!name || name === given}>
             {t("common.save")}
           </Button>
         </DialogFooter>

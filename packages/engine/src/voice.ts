@@ -1,12 +1,29 @@
 import type { BlobStoreResolver, PubSub, SpeechEngine } from "@agenteschat/adapters";
-import { SpeechError } from "@agenteschat/adapters";
-import { and, asc, count, type Database, desc, eq, gt, gte, isNull, lt, ne, schema, sql } from "@agenteschat/db";
+import { firstWords, typingTopic } from "@agenteschat/adapters";
+import {
+  and,
+  asc,
+  count,
+  type Database,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  ne,
+  or,
+  schema,
+  sql,
+} from "@agenteschat/db";
 import { requireChannelAccess } from "./channels";
 import { ForbiddenError, NotFoundError, ValidationError } from "./errors";
-import { publishUserEvent } from "./events";
+import { publishTyping, publishUserEvent } from "./events";
 import type { Judge } from "./judge";
 import type { MessageVoice } from "./message-preview";
-import { postPersonMessage } from "./messages";
+import { attachmentRefsFor, MAX_MESSAGE_LENGTH, postPersonMessage } from "./messages";
 import { can } from "./organizations";
 import { enqueue } from "./outbox";
 
@@ -63,6 +80,8 @@ export interface VoiceDeps {
   judge?: Judge | null;
   /** Tests: how long an engine works alone (`hedgeAfterMs`). */
   hedgeAfterMs?: (durationMs: number) => number;
+  /** Tests: how often "gravando áudio…" goes out again while the words are made out (`VOICE_BEAT_MS`). */
+  beatMs?: number;
 }
 
 /** How long an engine has a recording to itself before the next one starts beside it: 19 s for 88 s of audio. */
@@ -132,6 +151,10 @@ export async function acceptVoiceClip(
     threadId?: string | null;
     replyTo?: string | null;
     language?: string | null;
+    /** Typed beside the take, with the same limit as a typed message. */
+    text?: string | null;
+    /** Files (artifact ids) sent with it, checked as a typed message's. */
+    attachments?: string[] | null;
   },
 ): Promise<{ clipId: string }> {
   const { membership } = await requireChannelAccess(deps.db, userId, orgId, channelId);
@@ -151,6 +174,16 @@ export async function acceptVoiceClip(
     throw new ValidationError("The recording is too long or too short", "voice.bad_duration");
   }
   if (!(await voiceAllowed(deps, userId, orgId))) throw new ValidationError("Too many voice messages", "voice.limit");
+  const text = input.text?.trim() || null;
+  if (text && text.length > MAX_MESSAGE_LENGTH) {
+    throw new ValidationError(`Message is longer than ${MAX_MESSAGE_LENGTH} characters`, "message.too_long", {
+      length: text.length,
+      max: MAX_MESSAGE_LENGTH,
+    });
+  }
+  const attachments = input.attachments?.length
+    ? (await attachmentRefsFor(deps.db, userId, orgId, channelId, input.attachments)).map((f) => f.id)
+    : null;
   const declared = input.contentType.split(";")[0]?.trim().toLowerCase() || "audio/mp4";
   const contentType = VOICE_ARRIVES_AS[declared] ?? declared;
   if (!VOICE_TYPES.includes(contentType)) throw new ValidationError("Not a voice recording", "voice.bad_type");
@@ -176,6 +209,8 @@ export async function acceptVoiceClip(
         durationMs: Math.round(input.durationMs),
         peaks: cleanPeaks(input.peaks),
         language: input.language?.slice(0, 8) ?? null,
+        text,
+        attachments,
       })
       .onConflictDoNothing()
       .returning({ id: voiceClips.id });
@@ -259,56 +294,44 @@ async function wordsOf(
     orgId: clip.orgId,
     durationMs: clip.durationMs,
   };
-  const engines = deps.engines();
-  const alone = (deps.hedgeAfterMs ?? hedgeAfterMs)(clip.durationMs);
-  return new Promise((resolve, reject) => {
-    // The last failure that a retry may get past: one engine busy is worth a retry even when the others refused.
-    let last: unknown = null;
-    let refused = false;
-    let next = 0;
-    let working = 0;
-    let done = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const start = () => {
-      clearTimeout(timer);
-      if (done) return;
-      const engine = engines[next++];
-      if (!engine) {
-        if (working > 0) return;
-        done = true;
-        if (refused && !last) resolve(null);
-        else reject(last ?? new Error("no speech engine on this server"));
-        return;
-      }
-      working++;
-      engine.file(input).then(
-        ({ text }) => {
-          working--;
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          resolve({ engine, text: text.trim() });
-        },
-        (error: unknown) => {
-          working--;
-          if (error instanceof SpeechError && error.reason === "refused") refused = true;
-          else last = error;
-          start();
-        },
-      );
-      if (next < engines.length) timer = setTimeout(start, alone);
-    };
-    start();
+  return firstWords(deps.engines(), input, (deps.hedgeAfterMs ?? hedgeAfterMs)(clip.durationMs));
+}
+
+/** The apps' pace for "gravando áudio…", within its 5 s (`TYPING_TTL_MS`). */
+const VOICE_BEAT_MS = 3000;
+
+/**
+ * "Marina está gravando áudio…" for the others while her recording's words are made out, until the stop this returns:
+ * the apps keep it while recording and uploading, and the message clears it as it comes. Writing takes over, as in the
+ * apps: her typing frame in that channel ends it.
+ */
+function keepRecording(
+  deps: Pick<VoiceDeps, "pubsub" | "beatMs">,
+  where: { channelId: string; threadId: string | null; userId: string },
+) {
+  let beat = publishTyping(deps.pubsub, { ...where, kind: "voice" });
+  const timer = setInterval(() => {
+    beat = publishTyping(deps.pubsub, { ...where, kind: "voice" });
+  }, deps.beatMs ?? VOICE_BEAT_MS);
+  const off = deps.pubsub.subscribe(typingTopic, (e) => {
+    if (e.type === "user.typing" && !e.kind && e.userId === where.userId && e.channelId === where.channelId)
+      clearInterval(timer);
   });
+  return async () => {
+    clearInterval(timer);
+    off();
+    // Out before the message, never after it: a late one would bring the line back over her message.
+    await beat;
+  };
 }
 
 const costOf = (engine: SpeechEngine, durationMs: number) =>
   Math.round((Math.max(durationMs / 1000, engine.minBilledSeconds) / 3600) * engine.nanoUsdPerHour);
 
 /**
- * Job `voice.transcribe`: the recording's words, then the message, as if the person had sent it. Nothing said drops
- * the recording and tells its sender; words nobody can make out after every try still go out, as audio people can
- * hear, and the agent is told so.
+ * Job `voice.transcribe`: the recording's words, then the message, as if the person had sent it, with the text typed
+ * beside the take first and its files. Nothing said and nothing typed or attached drops the recording and tells its
+ * sender; words nobody can make out after every try still go out, as audio people can hear, and the agent is told so.
  */
 export async function transcribeVoiceClip(deps: VoiceDeps, clipId: string, options: { finalAttempt: boolean }) {
   const [clip] = await deps.db.select().from(voiceClips).where(eq(voiceClips.id, clipId));
@@ -318,21 +341,30 @@ export async function transcribeVoiceClip(deps: VoiceDeps, clipId: string, optio
   const stored = await place.get(clip.blobKey);
   if (!stored) return dropClip(deps, clip, "refused");
   let words: Awaited<ReturnType<typeof wordsOf>>;
+  const recorded = keepRecording(deps, { channelId: clip.channelId, threadId: clip.threadId, userId: clip.userId });
   try {
     words = await wordsOf(deps, clip, stored.body);
   } catch (error) {
     if (!options.finalAttempt) throw error;
     words = null;
+  } finally {
+    await recorded();
   }
-  if (words && !words.text) return dropClip(deps, clip, "silent");
+  const typed = clip.text ?? "";
+  if (words && !words.text && !typed && !clip.attachments?.length) return dropClip(deps, clip, "silent");
   const expiresAt = expiryOf(clip.createdAt, deps.retentionDays);
   const voice: MessageVoice = {
     clipId: clip.id,
     durationMs: clip.durationMs,
     peaks: clip.peaks,
     ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
-    ...(words ? {} : { noWords: true as const }),
+    ...(words ? {} : typed ? { unheard: true as const } : { noWords: true as const }),
+    ...(typed ? { text: typed } : {}),
   };
+  // Typed first, so agents, mentions and search read both: the apps show `meta.voice.text` as text, the rest as words.
+  // The typed text may use the whole length a message has: the words then keep what is left of it.
+  const spoken = words ? words.text : VOICE_NO_WORDS_BODY;
+  const said = typed ? spoken.slice(0, Math.max(0, MAX_MESSAGE_LENGTH - typed.length - 2)) : spoken;
   try {
     const message = await postPersonMessage(
       { db: deps.db, pubsub: deps.pubsub, judge: deps.judge ?? undefined },
@@ -340,8 +372,9 @@ export async function transcribeVoiceClip(deps: VoiceDeps, clipId: string, optio
       clip.orgId,
       clip.channelId,
       {
-        body: words?.text ?? VOICE_NO_WORDS_BODY,
+        body: typed && said ? `${typed}\n\n${said}` : typed || said,
         threadId: clip.threadId,
+        attachments: clip.attachments ?? undefined,
         clientId: clip.clientId,
         replyTo: clip.replyTo,
         meta: { voice },
@@ -444,6 +477,46 @@ async function dropAudio(deps: Pick<VoiceDeps, "db" | "blobs">, clip: ClipAudio)
   const store = await deps.blobs.forConfig(clip.orgId, clip.storageConfigId);
   await store.delete(clip.blobKey);
   await deps.db.update(voiceClips).set({ audioDeletedAt: new Date() }).where(eq(voiceClips.id, clip.id));
+}
+
+/**
+ * A thread's voice messages lose the words made out of them, and their recordings leave storage where `blobs` says
+ * how (one that can't be deleted now stays for the next call).
+ */
+export async function dropThreadVoice(
+  deps: { db: Database; blobs?: BlobStoreResolver },
+  thread: { orgId: string; channelId: string; rootMessageId: string },
+) {
+  const clips = await deps.db
+    .select({
+      id: voiceClips.id,
+      orgId: voiceClips.orgId,
+      storageConfigId: voiceClips.storageConfigId,
+      blobKey: voiceClips.blobKey,
+      heard: voiceClips.audioDeletedAt,
+    })
+    .from(voiceClips)
+    .where(
+      and(
+        eq(voiceClips.orgId, thread.orgId),
+        eq(voiceClips.channelId, thread.channelId),
+        or(eq(voiceClips.threadId, thread.rootMessageId), eq(voiceClips.messageId, thread.rootMessageId)),
+        or(isNotNull(voiceClips.text), isNull(voiceClips.audioDeletedAt)),
+      ),
+    );
+  if (clips.length === 0) return;
+  await deps.db
+    .update(voiceClips)
+    .set({ text: null })
+    .where(
+      inArray(
+        voiceClips.id,
+        clips.map((c) => c.id),
+      ),
+    );
+  const blobs = deps.blobs;
+  if (!blobs) return;
+  for (const clip of clips) if (!clip.heard) await dropAudio({ db: deps.db, blobs }, clip).catch(() => undefined);
 }
 
 /** A deleted channel's recordings leave storage now, whatever the retention (a failure throws, so its job retries). */

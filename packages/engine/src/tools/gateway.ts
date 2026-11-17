@@ -10,6 +10,7 @@ import {
 import { startInFlight } from "@agenteschat/adapters/in-flight";
 import { and, desc, eq, inArray, isNotNull, isNull, or, schema, sql } from "@agenteschat/db";
 import { auditsCall, callSubject, callTitle, recordToolCall, type ToolCallSubject } from "../agent-audit";
+import { getAgentCached } from "../agents";
 import {
   COMMAND_RULE_TOOL,
   coveringRules,
@@ -17,12 +18,29 @@ import {
   MAX_OWN_ACTIONS,
   OWN_ACTION_NAME,
   type RememberedKind,
+  rememberedKindOf,
   rulesApprover,
   SQL_READS,
   sqlReadsTarget,
 } from "../approval-rules";
-import { fedByRoutine, type RunAuthority, runAuthorityById, UUID } from "../authority";
+import {
+  fedByRoutine,
+  MAX_AUTHORITY_CHAIN,
+  type RunAuthority,
+  runAuthorityById,
+  steeredByOf,
+  transcriptKeys,
+  UUID,
+} from "../authority";
 import { type CostKind, costlyGate, costlyKind, LONG_STEPS, unrequested } from "../brakes";
+import {
+  CONFIDENTIAL_STUB,
+  markThreadConfidential,
+  noteConfidentialRun,
+  type RunConfidentiality,
+  runConfidentiality,
+  thinksAsThread,
+} from "../confidential";
 import { countToolCall } from "../connector-usage";
 import { actionLevel, nameWords, openEnded } from "../connectors/classify";
 import { missingConnectors, type ServerCatalog } from "../connectors/listing";
@@ -30,13 +48,14 @@ import { answersAgentsOnly, consultationOrigin } from "../consultations";
 import { recordOutcome } from "../context/outcomes";
 import { sha256 } from "../crypto";
 import { provenReadOnly } from "../databases/guard";
-import { isUnexpectedError } from "../errors";
-import { cutMarked, cutText, pgSafeJson, pgSafeText } from "../format";
+import { errorNumber, isUnexpectedError, ToolOffError } from "../errors";
+import { cutMarked, cutText, inertJson, inertLinks, pgSafeJson, pgSafeText } from "../format";
 import { mergeReposOfCall, recordMergeDone, reposOfGithubCall } from "../git/repos";
 import { recordRead } from "../outbound";
 import { routineCreatorOf } from "../requester";
-import { isRightHandId, RIGHT_HAND_NO_COMPUTER } from "../right-hand";
-import type { RoutineBrief } from "../routine-brief";
+import { isRightHand, RIGHT_HAND_NOT_OFFERED } from "../right-hand";
+import { type RoutineBrief, routineBriefOf } from "../routine-brief";
+import { keysOfCall, RUN_CODE_TOOL, routineKeysAllowed, routineKeysKind } from "../routine-keys";
 import { addRunStep } from "../runs";
 import { describeWhen } from "../schedule";
 import { REQUEST_SECRET_TOOL } from "../secrets";
@@ -53,6 +72,13 @@ import {
 import { carriesCredential, promptAnswer, toolCommand, toolDetail } from "../tool-detail";
 import { untrustedBlock } from "../untrusted";
 import { checkToolCall } from "./checks";
+import {
+  asksOutside,
+  CARD_WORDS,
+  CONFIDENTIAL_REFUSAL,
+  confidentialLockAllows,
+  confidentialRefusal,
+} from "./confidential-lock";
 import { connectorFirst } from "./connector-first";
 import { type BlockedTool, compactSchema, presentTools, resolveCall } from "./directory";
 import { canonicalJson, validateJson } from "./json-schema";
@@ -83,7 +109,7 @@ import {
 } from "./scopes";
 import type { AheadOutcome, AheadRequest, ToolContext, ToolDefinition, ToolOutput, ToolSource } from "./types";
 
-const { approvals, agents, agentRunSteps, routines } = schema;
+const { approvals, agents, agentConsultations, agentRuns, agentRunSteps, messages, routines } = schema;
 type AuditOutcome = schema.AuditOutcome;
 
 /** Merge, deploy and rollback need a person whatever a connector says, unless the agent never asks (ADR 0173). */
@@ -187,7 +213,7 @@ export async function rememberKinds(
 
 /** Our own tools whose job is asking a person: the agent chose to ask, so one that never asks still does. */
 const ASKING_TOOLS = new Set(["request_approval", REQUEST_PERMISSION_TOOL, "send_feedback"]);
-const asksByChoice = (tool: Pick<ToolDefinition, "name" | "scope" | "connectionId">) =>
+export const asksByChoice = (tool: Pick<ToolDefinition, "name" | "scope" | "connectionId">) =>
   tool.connectionId ? tool.name === "request_branch_push" && serverGitTool(tool) : ASKING_TOOLS.has(tool.name);
 
 /**
@@ -210,6 +236,56 @@ export function unaskedAtNever(level: ApprovalsLevel, tool: ToolDefinition, auth
 const NEVER_IN_ROUTINE =
   /^(delete|deletes|deleted|remove|removes|destroy|drop|purge|erase|wipe|trash|truncate|overwrite|revoke|unbind|pay|pays|payment|payments|payout|payouts|refund|refunds|charge|charges|transfer|transfers|invoice|invoices|purchase|buy|renew|checkout|withdraw|withdrawal|approve|review|reviews)$/;
 const neverInRoutine = (name: string) => nameWords(name).some((w) => NEVER_IN_ROUTINE.test(w));
+
+/** Words of a tool that runs whatever its input says: code, a command, a script, a raw request, a query, a migration. */
+const RUNS_ITS_INPUT = new Set(
+  "run exec execute eval evaluate invoke trigger shell bash script command code terminal workbench proxy raw http query request call api function custom migration apply".split(
+    " ",
+  ),
+);
+/** Words of a call that posts in public, changes who gets in, moves money or puts other people's work away. */
+const REACHES_FAR = new Set(
+  "post posts tweet article pin video upload sharing collaborator member subscription budget clear archive cancel dns".split(
+    " ",
+  ),
+);
+/** A name that says all its call does, and nothing a person reads one by one: no merge, send, post, delete or payment. */
+const plainAction = (name: string) =>
+  !highRisk(name, "") &&
+  actionLevel(name) !== "sensitive" &&
+  !neverInRoutine(name) &&
+  !nameWords(name).some((w) => RUNS_ITS_INPUT.has(w) || REACHES_FAR.has(w));
+
+type AskedCall = Pick<
+  Approval,
+  "tool" | "scope" | "connectionId" | "highRisk" | "approvers" | "approveAlways" | "origin"
+>;
+
+/** A waiting call that is SQL the Postgres guard proved read-only when it asked (`rememberKinds`). */
+export function readsSqlOnly(a: Pick<Approval, "approveAlways">): boolean {
+  const kept = rememberedKindOf(a.approveAlways)?.actions ?? [];
+  return kept.length > 0 && kept.every((action) => action.startsWith(SQL_READS));
+}
+
+/**
+ * Whether a waiting call may be approved together with others in one tap, as far as its row tells. It errs towards
+ * leaving a call on its own card: only a connected app's named action passes, or SQL proven read-only (`readsSqlOnly`).
+ * Never one that is high risk, sends, posts, deletes or pays by any word of its name, runs whatever its input says
+ * (Composio's executor too: nothing vouches for the actions its input names), asks by choice, or names who decides
+ * (`request_approval`, someone's mailbox). Our own tools stay out whole: a command on the agent's computer, its
+ * browser, the workspace's people, keys and settings. A row does not say why its call asked, so a name is never
+ * enough: the connection has its say after this (`routineIds` in `approvals.ts`).
+ */
+export function routineCall(a: AskedCall): boolean {
+  if (!a.connectionId || a.approvers || a.scope.startsWith("mail:")) return false;
+  if (asksByChoice({ name: a.tool, scope: a.scope, connectionId: a.connectionId })) return false;
+  if (readsSqlOnly(a)) return true;
+  // At the level that asks for some things (the only one that offers a kind to keep), a person's run asks a
+  // connected app's call only when the tool is marked to ask.
+  if (!a.origin && a.approveAlways) return false;
+  if (a.highRisk) return false;
+  return [a.tool, ...(rememberedKindOf(a.approveAlways)?.actions ?? [])].every(plainAction);
+}
 
 /** The scope of the GitHub connector's `merge_pull_request`. */
 const GITHUB_MERGE_SCOPE = "github:pr.merge";
@@ -261,6 +337,12 @@ const serverGitTool = (tool: Pick<ToolDefinition, "name" | "scope">) =>
   (tool.name === "git_clone" && tool.scope === "github:git.read") ||
   (tool.name === "open_pull_request" && tool.scope === "github:pr.write") ||
   ((tool.name === "delete_branches" || tool.name === "request_branch_push") && tool.scope === "github:git.write");
+/**
+ * One of the server's own tools, never a connected app's: its name is written here, not by a workspace or by the
+ * server it connected.
+ */
+const ownTool = (tool: Pick<ToolDefinition, "name" | "scope" | "connectionId">) =>
+  !tool.connectionId || serverGitTool(tool);
 
 /**
  * An `external` tool's output (an MCP server's answer) reaches the model inside the one envelope for
@@ -368,7 +450,6 @@ async function refusalOf(
   granted: Set<string>,
 ) {
   const of = access.of;
-  if (NOT_IN_ALL.has(of.scope) && (await isRightHandId(ctx.db, ctx.orgId, ctx.agentId))) return RIGHT_HAND_NO_COMPUTER;
   if (access.state === "denied") {
     return `${of === tool ? "this tool" : of.name} is turned off for this agent, not for good: an admin can turn it back on, on the agent's page in Tools and access (in Portuguese, Ferramentas e acesso). Say so in plain words (the person asking may be that admin), never that it can't be done`;
   }
@@ -427,8 +508,12 @@ const authorityOf = (ctx: ToolContext): Promise<RunAuthority | null> =>
   ctx.runId ? runAuthorityById(ctx.db, ctx.orgId, ctx.runId) : Promise.resolve(null);
 
 const ALLOWED: PolicyDecision = { action: "allow" };
-const policyFor = (authority: RunAuthority | null, tool: ToolDefinition, level = DEFAULT_APPROVALS_LEVEL) =>
-  authority ? toolPolicy(authority, tool, level) : ALLOWED;
+const policyFor = (
+  authority: RunAuthority | null,
+  tool: ToolDefinition,
+  level = DEFAULT_APPROVALS_LEVEL,
+  creatorDecides = false,
+) => (authority ? toolPolicy(authority, tool, level, creatorDecides) : ALLOWED);
 
 /**
  * A tool as a run sees it: one the policy says asks a person becomes sensitive (its card, and the
@@ -487,6 +572,29 @@ export type InvokeResult =
 const readsOutsideText = (tool: ToolDefinition, output: ToolOutput) =>
   Boolean(tool.external || tool.readsOutside) && output.content.trim() !== "";
 
+/**
+ * Whether a run may be handed a confidential answer (ADR 0190): only one that thinks through the Model Gateway, which
+ * the lock below holds. A program on a computer keeps what it reads and has a shell and a web fetch of its own that
+ * never pass here, and a call with no run has no thread to keep the words in: both get the stub. So does a run that
+ * thinks with another provider than the one its thread's words already stay with (`thinksAsThread`).
+ */
+const readsConfidential = (ctx: ToolContext, sealed: RunConfidentiality | null) =>
+  !ctx.bridge && sealed?.brain === "model" && thinksAsThread(sealed, ctx.thinksWith);
+
+const lockAllows = (tool: ToolDefinition, marking: readonly string[], asksOut: boolean) =>
+  confidentialLockAllows(tool, { own: ownTool(tool), marking, asksOutside: asksOut });
+
+/** Whether what this run asks a person would be posted outside its thread (`asksOutside`). */
+const asksOutsideThread = async (ctx: ToolContext, authority: RunAuthority | null) =>
+  asksOutside(ctx, authority, ctx.runId ? await consultationOrigin(ctx.db, ctx.orgId, ctx.runId) : null);
+
+/** A confidential answer for a caller that may not read it: the stub, with nothing of the mark left on it. */
+const stubbed = (output: ToolOutput): ToolOutput => ({
+  content: CONFIDENTIAL_STUB,
+  ...(output.isError ? { isError: true } : {}),
+  ...(output.data ? { data: output.data } : {}),
+});
+
 export function createToolGateway(deps: {
   sources: ToolSource[];
   now?: () => Date;
@@ -504,14 +612,15 @@ export function createToolGateway(deps: {
 
   async function allTools(ctx: ToolContext) {
     const byName = new Map<string, ToolDefinition>();
+    const rightHand = isRightHand(await getAgentCached(ctx.db, ctx.orgId, ctx.agentId));
     for (const source of deps.sources) {
       for (const tool of await source.tools(ctx)) {
         if (!TOOL_NAME.test(tool.name)) continue;
+        if (rightHand && RIGHT_HAND_NOT_OFFERED.has(tool.name)) continue;
         const current = byName.get(tool.name);
         // A connected MCP server must not shadow one of our own tools just
         // because its source appears earlier in the list.
-        if (!current || (current.connectionId && (!tool.connectionId || serverGitTool(tool))))
-          byName.set(tool.name, tool);
+        if (!current || (current.connectionId && ownTool(tool))) byName.set(tool.name, tool);
       }
     }
     return byName;
@@ -533,15 +642,16 @@ export function createToolGateway(deps: {
     known?: Map<string, ToolDefinition>,
     heldBack?: string[],
   ): Promise<ToolDefinition[]> {
-    const [keys, all, level] = await Promise.all([
+    const [keys, all, level, decides] = await Promise.all([
       grantedScopeKeys(ctx.db, ctx.orgId, ctx.agentId),
       known ?? allTools(ctx),
       approvalsLevelOf(ctx.db, ctx.orgId, ctx.agentId),
+      creatorDecides(ctx, authority),
     ]);
     return [...all.values()]
       .filter((t) => isAllowed(accessWithNeeds(keys, t).state))
       .flatMap((t) => {
-        const decision = policyFor(authority, t, level);
+        const decision = policyFor(authority, t, level, decides);
         if (decision.action !== "refuse") return [asListed(t, decision, unaskedAtNever(level, t, authority))];
         heldBack?.push(t.name);
         return [];
@@ -643,10 +753,22 @@ export function createToolGateway(deps: {
       // Our own tool breaking in a way nobody foresaw is the app's fault, not the agent's nor an outside service's.
       const hint =
         deps.faultHint && !tool.external && !tool.connectionId && isUnexpectedError(error) ? deps.faultHint : "";
+      // What the thrown error says of itself in a number: an MCP client's `code` (an HTTP status, or a JSON-RPC
+      // error's reserved code), else a `status`. Kept with the code so a reader tells how the call failed without its
+      // words. Any other number an error carries under `code` (an errno, a DOMException's) is not one.
+      const status =
+        errorNumber(error, "code", 100, 599) ??
+        errorNumber(error, "code", -32768, -32000) ??
+        errorNumber(error, "status", 100, 599);
       // An MCP server's error text is its own words too.
       return {
         content: `Tool failed: ${tool.external ? wrapExternal(tool.name, message) : message}${hint && `\n${hint}`}`,
         isError: true,
+        data: {
+          code: "tool.failed",
+          ...(status !== null ? { status } : {}),
+          ...(error instanceof ToolOffError ? { toolOff: error.toolOff } : {}),
+        },
       };
     } finally {
       done();
@@ -798,6 +920,105 @@ export function createToolGateway(deps: {
     return row ?? null;
   }
 
+  /** Whether a routine's own run has a creator who still decides its agent's approvals (`toolPolicy`). Read fresh. */
+  async function creatorDecides(ctx: ToolContext, authority: RunAuthority | null) {
+    if (authority?.kind !== "routine" || !authority.brief || !UUID.test(authority.brief.routineId)) return false;
+    const row = await routineOf(ctx, authority.brief);
+    return row?.creator ? decidesAgentApprovals(ctx.db, ctx.orgId, row.creator, row.owner) : false;
+  }
+
+  /** The messages a run read after its trigger, as they joined it (between steps or live: `steeredMessageIds`). */
+  async function joinedReads(ctx: ToolContext, runId: string) {
+    const steps = await ctx.db
+      .select({ data: agentRunSteps.data })
+      .from(agentRunSteps)
+      .where(
+        and(
+          eq(agentRunSteps.orgId, ctx.orgId),
+          eq(agentRunSteps.runId, runId),
+          eq(agentRunSteps.kind, "context"),
+          sql`${agentRunSteps.data} ? 'steeredMessageIds'`,
+        ),
+      );
+    const ids = steps.flatMap((s) => (Array.isArray(s.data.steeredMessageIds) ? s.data.steeredMessageIds : []));
+    return [...new Set(ids)].filter((id): id is string => typeof id === "string" && UUID.test(id));
+  }
+
+  /** The notice a message is, as the server wrote it; never a person's message. */
+  async function noticeOfMessage(ctx: ToolContext, messageId: string) {
+    const [m] = await ctx.db
+      .select({ authorType: messages.authorType, meta: messages.meta })
+      .from(messages)
+      .where(and(eq(messages.orgId, ctx.orgId), eq(messages.id, messageId)));
+    if (!m || m.authorType === "person") return null;
+    return (m.meta.notice ?? null) as { kind?: unknown; refs?: Record<string, unknown> } | null;
+  }
+
+  /** The run that asked the question a `consult_reply` notice answers, when a teammate of this agent answered it. */
+  async function answeredAsker(ctx: ToolContext, notice: { kind?: unknown; refs?: Record<string, unknown> } | null) {
+    const id = notice?.kind === "consult_reply" ? notice.refs?.consultationId : null;
+    if (typeof id !== "string" || !UUID.test(id)) return null;
+    const [c] = await ctx.db
+      .select({ askerRunId: agentConsultations.askerRunId, targetAgentId: agentConsultations.targetAgentId })
+      .from(agentConsultations)
+      .where(
+        and(
+          eq(agentConsultations.orgId, ctx.orgId),
+          eq(agentConsultations.id, id),
+          eq(agentConsultations.askerAgentId, ctx.agentId),
+          eq(agentConsultations.kind, "question"),
+          eq(agentConsultations.status, "answered"),
+        ),
+      );
+    return c && c.targetAgentId !== ctx.agentId ? c.askerRunId : null;
+  }
+
+  /**
+   * Whether a run nobody is behind still does routine `routineId`'s own job (ADR 0053, addendum 2026-11-13): that
+   * routine's report woke it (`routine_handoff`) and nothing joined it since, or a teammate's answer to a question a
+   * run doing that job asked woke it (that routine's own run included) and what joined it since is only more answers
+   * to that run's questions. Walked through the server's links (a notice's run, a consultation's asker), never text.
+   */
+  async function onOwnJob(ctx: ToolContext, routineId: string) {
+    let runId = ctx.runId;
+    let mustBeRoutine = false;
+    for (let depth = 0; depth <= MAX_AUTHORITY_CHAIN; depth++) {
+      const [run] = await ctx.db
+        .select({
+          agentId: agentRuns.agentId,
+          background: agentRuns.background,
+          triggerMessageId: agentRuns.triggerMessageId,
+          transcript: transcriptKeys("steeredBy"),
+        })
+        .from(agentRuns)
+        .where(and(eq(agentRuns.orgId, ctx.orgId), eq(agentRuns.id, runId)));
+      if (!run || run.agentId !== ctx.agentId) return false;
+      if (run.background) {
+        const [trigger] = await ctx.db
+          .select({ meta: messages.meta })
+          .from(messages)
+          .where(and(eq(messages.orgId, ctx.orgId), eq(messages.id, run.triggerMessageId)));
+        return routineBriefOf(trigger?.meta)?.routineId === routineId;
+      }
+      // A person who wrote into a run is behind it from then on: what it asked is theirs, not the routine's.
+      if (mustBeRoutine || steeredByOf(run.transcript)) return false;
+      const notice = await noticeOfMessage(ctx, run.triggerMessageId);
+      const joined = await joinedReads(ctx, runId);
+      if (notice?.kind === "routine_handoff") {
+        const reporter = notice.refs?.runId;
+        if (joined.length > 0 || typeof reporter !== "string" || !UUID.test(reporter)) return false;
+        runId = reporter;
+        mustBeRoutine = true;
+        continue;
+      }
+      const asker = await answeredAsker(ctx, notice);
+      if (!asker) return false;
+      for (const id of joined) if ((await answeredAsker(ctx, await noticeOfMessage(ctx, id))) !== asker) return false;
+      runId = asker;
+    }
+    return false;
+  }
+
   /**
    * Whether a routine's run may do this call without a card (`routines.own_actions`, ADR 0053 §2 addendum of
    * 2026-11-03: setting the routine up approved its job, so it doesn't ask every run). Every action the call runs is one its creator
@@ -887,6 +1108,25 @@ export function createToolGateway(deps: {
   }
 
   /**
+   * A confidential result's step, written with its thread's mark or not at all (ADR 0190): a step that carried the
+   * mark in a thread that didn't would leave the words readable from outside it.
+   */
+  async function markedStep(ctx: ToolContext, connectionId: string | null, data: Record<string, unknown>) {
+    await ctx.db.transaction(async (tx) => {
+      await markThreadConfidential(tx, {
+        orgId: ctx.orgId,
+        channelId: ctx.channelId,
+        rootId: ctx.threadRootId,
+        connectionId,
+        thinksWith: ctx.thinksWith ?? null,
+      });
+      await addRunStep(tx, { id: ctx.runId, orgId: ctx.orgId }, "tool_result", data);
+    });
+    ctx.confidential = true;
+    noteConfidentialRun(ctx.runId);
+  }
+
+  /**
    * Runs an approved action, exactly as hashed: the stored params, the same tool and scope, at most once. Scope and
    * the arguments' rules are re-checked (they may have changed while it waited). `toolUseId`: the call it answers.
    */
@@ -900,6 +1140,8 @@ export function createToolGateway(deps: {
       params: approval.params,
     });
     const tool = (await allTools(ctx)).get(approval.tool);
+    /** The run's thread was confidential before this action ran (ADR 0190). */
+    let locked = false;
     // Why the approved action can't run any more; null = it may.
     const refusal = async (): Promise<string | null> => {
       if (expected !== approval.actionHash) return "Approval does not match the action";
@@ -908,15 +1150,27 @@ export function createToolGateway(deps: {
       const access = accessWithNeeds(await freshGrantedKeys(ctx.db, ctx.orgId, ctx.agentId), tool);
       if (!isAllowed(access.state))
         return `Not allowed: this agent lost the scope ${access.of.scope} since the approval. An admin can give it back on the agent's page in Tools and access (in Portuguese, Ferramentas e acesso); then asking again runs it`;
+      // Approved before its thread turned confidential (ADR 0190): the lock decides now, as for a call made now.
+      const sealed = ctx.runId ? await runConfidentiality(ctx.db, ctx.orgId, ctx.runId) : null;
+      if (sealed?.connectionIds) {
+        ctx.confidential = true;
+        locked = true;
+        // Nothing is asked now: a person already answered.
+        if (!lockAllows(tool, sealed.connectionIds, false)) return CONFIDENTIAL_REFUSAL;
+      }
       // Rules about the arguments again: a repository or recipient may have been removed while waiting.
       const check = await checkToolCall(tool, approval.params, ctx);
       return check.ok ? null : check.message;
     };
     let output: ToolOutput;
     let outside = false;
+    /** The connection whose confidential answer this run read; undefined: none. */
+    let marks: string | null | undefined;
     const refused = await refusal();
-    if (refused || !tool) output = { content: refused ?? "Not allowed", isError: true };
-    else {
+    if (refused || !tool) {
+      output =
+        refused === CONFIDENTIAL_REFUSAL ? confidentialRefusal() : { content: refused ?? "Not allowed", isError: true };
+    } else {
       // Claim the execution first: a retried job never runs the action twice. One approved ahead may have been
       // withdrawn or lapsed since it was read: only a row still approved runs.
       const claimed = await ctx.db
@@ -938,9 +1192,15 @@ export function createToolGateway(deps: {
         return ranBefore(row ?? approval);
       }
       output = await run(tool, approval.params, { ...ctx, toolUseId, approved: true }, 1);
+      if (output.confidential) {
+        const sealed = ctx.runId ? await runConfidentiality(ctx.db, ctx.orgId, ctx.runId) : null;
+        if (readsConfidential(ctx, sealed)) marks = tool.connectionId ?? null;
+        else output = stubbed(output);
+      }
       outside = readsOutsideText(tool, output);
-      // Team actions (ADR 0064): what a person approved and went out is the team's too.
-      if (isOutsideTool(tool) && !output.isError) {
+      // Team actions (ADR 0064): what a person approved and went out is the team's too. Not a call of a confidential
+      // thread (ADR 0190): its arguments would be kept for good and searched by every agent.
+      if (isOutsideTool(tool) && !output.isError && !locked) {
         await recordTeamAction(ctx.db, {
           orgId: ctx.orgId,
           agentId: ctx.agentId,
@@ -958,15 +1218,20 @@ export function createToolGateway(deps: {
       .set({ result: { content: shown(output.content), isError: output.isError === true } })
       .where(sql`${approvals.id} = ${approval.id}`);
     recordRead(ctx.runId, approval.tool, output.content, output.data, approval.params);
-    await addRunStep(ctx.db, { id: ctx.runId, orgId: ctx.orgId }, "tool_result", {
+    const confidential = marks !== undefined;
+    const step = {
       toolUseId,
       name: approval.tool,
       approvalId: approval.id,
       isError: output.isError === true,
       content: shown(output.content),
       ...(tool?.external ? { external: true } : {}),
-      ...(output.data || outside ? { data: { ...output.data, ...(outside ? { outside: true } : {}) } } : {}),
-    });
+      ...(output.data || outside || confidential
+        ? { data: { ...output.data, ...(outside ? { outside: true } : {}), ...(confidential ? { confidential } : {}) } }
+        : {}),
+    };
+    if (confidential) await markedStep(ctx, marks ?? null, step);
+    else await addRunStep(ctx.db, { id: ctx.runId, orgId: ctx.orgId }, "tool_result", step);
     // The audit: the approved action ran (or couldn't any more). Who approved it is the approval's row.
     if (tool) {
       const kind = toolKind(tool).kind;
@@ -986,6 +1251,7 @@ export function createToolGateway(deps: {
           outcome,
           reason: outcome === "done" ? null : shown(output.content),
           approvalId: approval.id,
+          confidential: ctx.confidential === true,
         });
       }
     }
@@ -1000,11 +1266,15 @@ export function createToolGateway(deps: {
       // The model's arguments land in jsonb and text columns (steps, approvals, the audit): a NUL would fail them.
       const requested = { ...raw, input: pgSafeJson(raw.input) };
       // Who is behind the run decides what it may do: listing already hid refused tools, this is the call.
-      const [all, authority, level] = await Promise.all([
+      const [all, authority, level, sealed] = await Promise.all([
         allTools(ctx),
         authorityOf(ctx),
         approvalsLevelOf(ctx.db, ctx.orgId, ctx.agentId),
+        ctx.runId ? runConfidentiality(ctx.db, ctx.orgId, ctx.runId) : null,
       ]);
+      // The caller's own context hears it too: where the run posts next follows its thread (`replyThreadOf`).
+      if (sealed?.connectionIds) ctx.confidential = true;
+      const asksOut = sealed?.connectionIds ? await asksOutsideThread(ctx, authority) : false;
       // A directory (tools/directory.ts): `use_tool` runs the tool it names by that tool's own name, so everything
       // below (steps, policy, scope, schema, checks, approval) is that tool's; `find_tools` runs as is. Any tool goes
       // through any `use_tool`, a directory's own and one already listed too: a computer brain's harness may still
@@ -1057,6 +1327,8 @@ export function createToolGateway(deps: {
         input: call.input,
         ...(detail ? { detail } : {}),
         ...(command ? { command } : {}),
+        // What the name was resolved to, kept with the call: the same name may be a connected server's another day.
+        ...(tool && ownTool(tool) ? { builtIn: true } : {}),
         ...(tool?.connectorLabel ? { connector: tool.connectorLabel } : {}),
         ...(tool?.service ? { service: tool.service } : {}),
         ...(tool?.serviceIcon ? { serviceIcon: tool.serviceIcon } : {}),
@@ -1098,6 +1370,7 @@ export function createToolGateway(deps: {
           outcome,
           approvalRules: approvedBy,
           unasked: unasked && outcome !== "refused",
+          confidential: ctx.confidential === true,
           ...extra,
         });
       };
@@ -1105,12 +1378,18 @@ export function createToolGateway(deps: {
        * `outcome`: what the audit says; none for a call that never really was one (a malformed input). `ran`: the
        * tool itself answered (not a gateway refusal).
        */
-      const finish = async (output: ToolOutput, outcome?: AuditOutcome, ran = false) => {
+      const finish = async (answer: ToolOutput, outcome?: AuditOutcome, ran = false) => {
+        // A confidential answer (ADR 0190): read, it marks the step and the run's thread; else the stub stands in.
+        const confidential = ran && answer.confidential === true && readsConfidential(ctx, sealed);
+        const output = answer.confidential && !confidential ? stubbed(answer) : answer;
         // A result read from outside marks the run (`runReadOutside`, ADR 0117), an error too: its text came from there.
         const outside = ran && tool && readsOutsideText(tool, output) ? { outside: true } : null;
-        const data = output.data || outside ? { ...output.data, ...outside } : null;
+        const data =
+          output.data || outside || confidential
+            ? { ...output.data, ...outside, ...(confidential ? { confidential } : {}) }
+            : null;
         recordRead(ctx.runId, call.name, output.content, output.data, call.input);
-        await record(ctx.db, step, "tool_result", {
+        const result = {
           toolUseId: call.toolUseId,
           name: call.name,
           isError: output.isError === true,
@@ -1119,7 +1398,9 @@ export function createToolGateway(deps: {
           ...(tool?.external ? { external: true } : {}),
           ...(data ? { data } : {}),
           ...(autoApproved ? { autoApproved } : {}),
-        });
+        };
+        if (confidential) await markedStep(ctx, tool?.connectionId ?? null, result);
+        else await record(ctx.db, step, "tool_result", result);
         const refusal = typeof output.data?.refusal === "string" ? output.data.refusal : null;
         if (outcome)
           await audit(
@@ -1129,8 +1410,9 @@ export function createToolGateway(deps: {
         return { type: "result" as const, output, ...(autoApproved ? { autoApproved } : {}) };
       };
 
-      if (unknownInDirectory) return finish({ content: unknownInDirectory, isError: true });
-      if (!tool) return finish({ content: `Unknown tool ${call.name}`, isError: true });
+      const unknown = { code: "tool.unknown" };
+      if (unknownInDirectory) return finish({ content: unknownInDirectory, isError: true, data: unknown });
+      if (!tool) return finish({ content: `Unknown tool ${call.name}`, isError: true, data: unknown });
       // A tool that runs other actions (Composio's executor): a call whose actions all only read is the
       // connection's read, when the agent may read the connection. Everything below then sees a read.
       if (tool.actions && tool.readScope) {
@@ -1150,14 +1432,32 @@ export function createToolGateway(deps: {
         const actions = tool.actions(takeWhy(tool.inputSchema, call.input).input);
         if (actions?.length && actions.every(opensPullRequestName)) tool = { ...tool, opensPullRequest: true };
       }
+      if (tool.sensitive && tool.asksNobody?.(call.input)) tool = { ...tool, sensitive: false };
       const builtIn = isBuiltIn(tool);
+      const decides = level === "risky" && (await creatorDecides(ctx, authority));
       // A call that only looks is judged as at the default level: an agent that always asks asks for changes.
-      const decision = policyFor(authority, tool, tool.looksOnly?.(call.input) ? DEFAULT_APPROVALS_LEVEL : level);
+      const decision = policyFor(
+        authority,
+        tool,
+        tool.looksOnly?.(call.input) ? DEFAULT_APPROVALS_LEVEL : level,
+        decides,
+      );
       if (decision.action === "refuse") {
         return finish(
           { content: decision.reason, isError: true, data: { code: "tool.not_allowed", refusal: "policy" } },
           "refused",
         );
+      }
+      // A confidential thread's lock (ADR 0190), before anything asks a person: a card is what an agent that never
+      // asks would have lifted.
+      if (sealed?.connectionIds && !lockAllows(tool, sealed.connectionIds, asksOut)) {
+        return finish(confidentialRefusal(), "refused");
+      }
+      // What a run of such a thread types on a card (a question, a poll, an approval's reason and detail) is shown
+      // as formatted text: no address in it may be a link, since a click on one could carry the words out.
+      const onCard = (text: string) => (sealed?.connectionIds ? inertLinks(text) : text);
+      if (sealed?.connectionIds && ownTool(tool) && CARD_WORDS.has(tool.name)) {
+        call = { ...call, input: inertJson(call.input) };
       }
       // A directory's search lists only tools the agent already holds; each real tool is checked on its own.
       if (tool !== directoryTool) {
@@ -1184,7 +1484,7 @@ export function createToolGateway(deps: {
       let whyMissing = false;
       if (asksPerson(tool, decision) || asksWithWhy(tool, call.input)) {
         const taken = takeWhy(tool.inputSchema, call.input);
-        why = taken.why ?? "";
+        why = onCard(taken.why ?? "");
         whyMissing = !taken.why && !unasked;
         call = { ...call, input: taken.input };
       }
@@ -1216,7 +1516,11 @@ export function createToolGateway(deps: {
         const schemaHint = viaDirectory ? `\nInput schema of ${tool.name}: ${compactSchema(listed.inputSchema)}` : "";
         // Everything the call lacks in one answer: told one field at a time, a model swaps one for the other.
         const needsWhy = whyMissing ? `. ${WHY_REFUSAL}` : "";
-        return finish({ content: `Invalid input: ${problems.join("; ")}${needsWhy}${schemaHint}`, isError: true });
+        return finish({
+          content: `Invalid input: ${problems.join("; ")}${needsWhy}${schemaHint}`,
+          isError: true,
+          data: { code: "tool.invalid_input" },
+        });
       }
       // A run a routine's reading feeds never sends a credential anywhere (ADR 0053 §3): a key it read on its
       // computer (a sandbox that can't keep it from being read) can't leave through any tool, on any brain. Any
@@ -1256,12 +1560,38 @@ export function createToolGateway(deps: {
       const remember = kinds[0] ?? null;
       if (await coveredBy(kinds)) approves = false;
       // The routine's own job: an action its creator allowed when they set it up runs like an allowed one, every run,
-      // unless its agent always asks.
-      const ownJob =
-        approves && level !== "always" && authority?.kind === "routine" && authority.brief
-          ? await ownJobCovers(ctx, authority.brief, tool, call.input)
-          : false;
+      // unless its agent always asks. The run its report woke does that job too, and so does the run a teammate's
+      // answer to that job's question woke (`onOwnJob`, ADR 0053, addendum 2026-11-13): anything else that woke or
+      // joined it (the end of a task, another routine's report, another agent's message) is not the job the person
+      // set up, and would choose an allowed action's arguments.
+      const ownJobBrief =
+        !approves || level === "always"
+          ? null
+          : authority?.kind === "routine"
+            ? authority.brief
+            : authority?.kind === "unattended" &&
+                fedByRoutine(authority) &&
+                authority.brief &&
+                (await onOwnJob(ctx, authority.brief.routineId))
+              ? authority.brief
+              : null;
+      const ownJob = ownJobBrief ? await ownJobCovers(ctx, ownJobBrief, tool, call.input) : false;
       if (ownJob) approves = false;
+      // A routine's own run puts Vault keys in a command only where its creator allowed them, or its agent never asks
+      // (ADR 0144 §2): else a person says yes first, and "Sempre nesta rotina" keeps those keys as the routine's own.
+      const keyNames =
+        tool.name === RUN_CODE_TOOL && !tool.connectionId && !never && authority?.kind === "routine" && authority.brief
+          ? keysOfCall(call.input)
+          : [];
+      const keysAt =
+        keyNames.length > 0 && authority?.kind === "routine" && authority.brief
+          ? { orgId: ctx.orgId, agentId: ctx.agentId, routineId: authority.brief.routineId }
+          : null;
+      const keysAsk =
+        keysAt && UUID.test(keysAt.routineId) && !(await routineKeysAllowed(ctx.db, keysAt, keyNames))
+          ? (level !== "always" && (await routineKeysKind(ctx.db, keysAt, tool.name, keyNames))) || false
+          : null;
+      if (keysAsk !== null) approves = true;
       // "Pode fazer merge sem perguntar": a merge in a repository its owner or an admin chose, with no card. An agent
       // that never asks merges anywhere it may, and leaves the same receipt.
       const mergeAlone: MergeDone | null = approves
@@ -1271,9 +1601,9 @@ export function createToolGateway(deps: {
           : null;
       if (mergeAlone) approves = false;
       // Approved ahead: the exact call a person approved for this routine run's slot runs like an allowed one, why
-      // or not; the one they refused never runs, whatever the agent's level.
+      // or not; the one they refused never runs, whatever the agent's level, a write its creator's run does unasked too.
       const ahead =
-        (approves || unasked) && authority?.kind === "routine" && authority.brief
+        (approves || unasked || decides) && authority?.kind === "routine" && authority.brief
           ? await aheadFor(
               ctx,
               authority.brief,
@@ -1323,7 +1653,10 @@ export function createToolGateway(deps: {
       const prompt = tool.name === PERMISSION_TOOL && builtIn ? promptQuestion(call.input) : null;
       const targets = outside ? callTargets(call.input) : (prompt?.action?.targets ?? []);
       let teamReason: string | null = null;
-      if (outside || prompt?.action) {
+      // Neither asked nor kept for a call of a confidential thread (ADR 0190): the check and the record hold the
+      // call's targets and words for good, outside the thread, and the record is searched by every agent.
+      const teamKnows = !sealed?.connectionIds;
+      if (teamKnows && (outside || prompt?.action)) {
         const seen = await checkTeamAction(ctx.db, ctx, {
           tool: prompt?.action?.tool ?? tool.name,
           targets,
@@ -1369,6 +1702,9 @@ export function createToolGateway(deps: {
           authority?.kind === "routine" && !(ctx.runId && (await answersAgentsOnly(ctx.db, ctx.orgId, ctx.runId)))
             ? authority.brief?.deliverTo
             : undefined;
+        // Out of a confidential thread (ADR 0190): a refusal, as for any tool that sends its words elsewhere. Its
+        // card would be read by other people, and a reply under it starts a run the lock does not hold.
+        if (asksOut) return finish(confidentialRefusal(), "refused");
         const origin = deliverTo
           ? { channelId: deliverTo.channelId, threadRootId: deliverTo.threadId ?? ctx.threadRootId }
           : ctx.runId
@@ -1399,8 +1735,8 @@ export function createToolGateway(deps: {
             connectionId,
             params: call.input,
             actionHash: actionHash({ tool: tool.name, scope: tool.scope, connectionId, params: call.input }),
-            title: cutMarked(described.title, 300),
-            detail: cutMarked(described.detail ?? "", APPROVAL_DETAIL_CHARS),
+            title: cutMarked(onCard(described.title), 300),
+            detail: cutMarked(onCard(described.detail ?? ""), APPROVAL_DETAIL_CHARS),
             why,
             origin: authority ? approvalOrigin(authority) : null,
             ownerUserId: owner,
@@ -1431,11 +1767,13 @@ export function createToolGateway(deps: {
         return { type: "approval", approval: row };
       };
       if (approves) {
-        // A routine's card offers "Sempre nesta rotina" where the action can be its own: the narrower word for the
-        // same run. Not for an agent that always asks: its routine's own actions ask too.
-        const own =
-          level !== "always" && authority?.kind === "routine" && authority.brief
-            ? await routineKind(ctx, authority.brief, tool, call.input)
+        // A card of a run doing a routine's job (its own run, or one its report or a teammate's answer woke:
+        // `ownJobBrief`) offers "Sempre nesta rotina" where the action can be its own: the narrower word for the same
+        // job. Not for an agent that always asks: its routine's own actions ask too.
+        const own = keysAsk
+          ? keysAsk
+          : keysAsk === null && ownJobBrief
+            ? await routineKind(ctx, ownJobBrief, tool, call.input)
             : null;
         return askPerson(why, own ?? remember);
       }
@@ -1463,7 +1801,7 @@ export function createToolGateway(deps: {
       }
       const merged = mergeAlone ?? (tool.whyAsks ? (output.data?.merge as MergeDone | undefined) : null);
       if (merged && !output.isError) await recordMergeDone(ctx, merged, tool.name).catch(() => {});
-      if (outside && !output.isError) {
+      if (teamKnows && outside && !output.isError) {
         await recordAction({
           source: "tool",
           tool: tool.name,
@@ -1473,7 +1811,7 @@ export function createToolGateway(deps: {
       }
       if (prompt) {
         const answer = promptAnswer(output.content);
-        if (prompt.action && (answer.behavior === "allow" || answer.status === "pending")) {
+        if (teamKnows && prompt.action && (answer.behavior === "allow" || answer.status === "pending")) {
           // A command waiting for a person counts already; it goes away if they say no.
           await recordAction({
             source: "command",

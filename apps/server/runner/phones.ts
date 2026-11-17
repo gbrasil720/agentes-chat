@@ -41,6 +41,7 @@ import {
   APPLE_APP,
   appleNeedsYou,
   IOS_MIN,
+  iosBehindSdk,
   needsUsbList,
   parseDevicectl,
   parseLockState,
@@ -229,6 +230,8 @@ export const REASON_WORDS: Partial<Record<PhoneReason, string>> = {
   ui_automation_off: "Turn on UI Automation on the iPhone: Settings › Developer › Enable UI Automation.",
   xcode_too_old:
     "This iPhone's iOS is newer than Xcode on this Mac. Install the Xcode matching the iPhone's iOS (27 for iOS 27), then run `xcrun devicectl manage ddis update`.",
+  ios_behind_xcode:
+    "This iPhone's iOS is older than the one Xcode on this Mac is for. Update the iPhone: Settings › General › Software Update.",
   device_support: "Xcode is still preparing the iPhone. Try again in a few minutes.",
   wifi_away: "The iPhone isn't on this Mac's Wi-Fi network. Join the same network on the iPhone, or plug it in.",
   wifi_asleep:
@@ -239,7 +242,7 @@ export const REASON_WORDS: Partial<Record<PhoneReason, string>> = {
     "The iPhone doesn't trust this Mac. Plug it in once, tap Trust and enter its passcode, then pick it over Wi-Fi again.",
 };
 
-/** Helper failures an Xcode older than the iPhone's iOS explains (its device support or test daemon too old). */
+/** Helper failures an Xcode that doesn't match the iPhone's iOS (older, or newer) explains (its device support or test daemon too old). */
 const OLD_XCODE_SIGNS = new Set<PhoneReason>(["device_support", "ui_not_authorized"]);
 
 /** Reasons only the test helper has: an iPhone still installs, opens apps and reads its log meanwhile. */
@@ -254,6 +257,7 @@ const HELPER_REASONS = new Set<PhoneReason>([
   "ui_not_authorized",
   // devicectl installs and opens apps on an iOS newer than the Mac's SDK: only the helper needs the matching Xcode.
   "xcode_too_old",
+  "ios_behind_xcode",
 ]);
 const NEEDS_HELPER = new Set(["phone.screenshot", "phone.record", "phone.flow"]);
 
@@ -274,7 +278,9 @@ export function phoneNotReady(p: Phone): { title: string; fix: string } | null {
   const fix =
     p.platform === "ios" && p.reason === "os_too_old"
       ? `It runs iOS ${p.osVersion || "16 or older"}, and agents need iOS ${IOS_MIN} or newer.`
-      : ((p.reason && REASON_WORDS[p.reason]) ?? "Try again in a moment.");
+      : p.reason === "ios_behind_xcode" && p.osVersion
+        ? `This iPhone runs iOS ${p.osVersion}, older than the one Xcode on this Mac is for. Update the iPhone: Settings › General › Software Update.`
+        : ((p.reason && REASON_WORDS[p.reason]) ?? "Try again in a moment.");
   return { title: `${labelOf(p)} ${p.state === "unsupported" ? "can't be used" : "isn't ready"}`, fix };
 }
 
@@ -467,6 +473,8 @@ export class PhoneManager {
   private reconnecting: Promise<void> | null = null;
   private readonly pairer: WifiPairer;
   private appleSeen: Phone[] | null = null;
+  /** The next look reads the Apple devices whatever the tick, keeping `appleSeen` for a devicectl that fails. */
+  private appleNow = false;
   private appleMisses = 0;
   /** iPhones on this Mac's Wi-Fi that trust it and aren't picked, from the last Apple look. */
   private nearby: WifiIphone[] = [];
@@ -542,8 +550,17 @@ export class PhoneManager {
     });
   }
 
-  /** `phone.look`: a phone guide waits for a phone. True when this computer looks for driverless ones (Windows). */
-  look(): boolean {
+  /**
+   * `phone.look`: a phone guide waits for a phone. A Mac reads its iPhones again now and answers once the list went out
+   * (the iPhone guide's "check again"); Windows looks for driverless phones for the next minute. False elsewhere.
+   */
+  async look(): Promise<boolean> {
+    if (this.platform === "darwin") {
+      await this.polling;
+      this.appleNow = true;
+      await this.poll();
+      return true;
+    }
     if (this.platform !== "win32") return false;
     this.lookUntil = this.now() + LOOK_MS;
     void this.poll();
@@ -733,7 +750,10 @@ export class PhoneManager {
     if (tools.adb) found.push(...(await this.scanAndroid(tools.adb, reach)));
     found.push(...(await this.scanDriverless(found)));
     if (tools.xcrun) {
-      if (this.appleSeen === null || this.tick % APPLE_EVERY === 0) this.appleSeen = await this.scanApple(tools);
+      if (this.appleSeen === null || this.appleNow || this.tick % APPLE_EVERY === 0) {
+        this.appleNow = false;
+        this.appleSeen = await this.scanApple(tools);
+      }
       found.push(...this.appleSeen);
     } else this.appleSeen = null;
     this.tick++;
@@ -941,8 +961,14 @@ export class PhoneManager {
       // An iOS newer than this Mac's iPhone SDK often still works (apps open, screenshots), so the version alone
       // turns nothing away: it names the likely cause once the helper itself is stuck.
       // device_support is only "preparing" to the helper, but with an older SDK the person has the way out.
-      const oldXcode = !!need && OLD_XCODE_SIGNS.has(need.reason) && sdkTooOld(phone.osVersion, tools.sdk);
-      const named = oldXcode ? { state: "needs_you" as const, reason: "xcode_too_old" as const } : {};
+      // The reverse too: an iPhone behind the SDK's iOS is named only when the helper is stuck the same way.
+      const signs = !!need && OLD_XCODE_SIGNS.has(need.reason);
+      const named =
+        signs && sdkTooOld(phone.osVersion, tools.sdk)
+          ? { state: "needs_you" as const, reason: "xcode_too_old" as const }
+          : signs && iosBehindSdk(phone.osVersion, tools.sdk)
+            ? { state: "needs_you" as const, reason: "ios_behind_xcode" as const }
+            : {};
       out.push(need ? { ...phone, ...need, ...named } : phone);
     }
     return out;

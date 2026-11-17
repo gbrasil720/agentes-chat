@@ -5,7 +5,9 @@ import { approvalCardThreads, approvalOriginOf, notifiedIds } from "./approvals"
 import { accountablePerson, runAuthorityById } from "./authority";
 import { autonomyNoteFor, proposalCardOf } from "./brakes";
 import { readableChannelIds } from "./channels";
+import { confidentialThreadSql, isConfidential } from "./confidential";
 import { threadFollowChoices } from "./follows";
+import { type Assignee, assigneesOfIssue } from "./issue-assignees";
 import { type TaskEnd, taskEndLine } from "./machine-task-text";
 import { isMediaAfterReply } from "./media";
 import { type PreviewMeta, previewMediaKind, previewMeta, readableBody } from "./message-preview";
@@ -21,12 +23,12 @@ import {
   remindNotifications,
   resolveNotifications,
   retargetNotifications,
+  unaskedGroup,
 } from "./notifications";
 import { maySql, type RolePermission } from "./permissions";
 import { secretLabelOf } from "./secrets";
 import { stretchCardOf } from "./stretch";
 import { adminChannelSql, taskReadersAmong } from "./task-access";
-import { teamWeekCardOf } from "./team-week";
 
 /**
  * Where notifications come from: each flow calls one of these after
@@ -161,12 +163,18 @@ export async function notifyMessage(deps: NotificationDeps, orgId: string, messa
   const authorUser = message.authorUserId;
   // A reminder's own words, without the English prefix the chat replaces with its own label.
   const said = typeof meta.reminderText === "string" ? meta.reminderText : await quotedBody(deps, orgId, message);
-  const text = notificationSnippet(readableBody(said, meta));
+  // A message of a confidential thread (ADR 0190) is told with no word of it: the inbox, the push and a mail that
+  // quote this say only that there is something to open.
+  const text = isConfidential(meta) ? "" : notificationSnippet(readableBody(said, meta));
   // Only a GIF or a sticker (ADR 0091): the apps and the push say which, in the person's language.
   const media = previewMediaKind(message.body, meta);
   // A body the server wrote: the apps say it in the reader's language, as the conversation lists do.
-  const written = previewMeta(meta);
-  const latest = { text, ...(media ? { media } : {}), ...(written ? { meta: written } : {}) };
+  const written = isConfidential(meta) ? null : previewMeta(meta);
+  // What the right hand posts by itself with a ring (`postFromLodi`) names its person on the message. Nobody asked,
+  // so it is no reply: it rings as a message it sent them. Its stored text is already in their language, so the
+  // inbox and the push quote it as it is.
+  const unasked = message.authorType === "agent" && !message.agentRunId && typeof meta.forUserId === "string";
+  const latest = { text, ...(media ? { media } : {}), ...(written && !unasked ? { meta: written } : {}) };
   const label = channel.kind === "channel" ? channel.name : undefined;
   const where: NotificationSource = {
     channelId: message.channelId,
@@ -190,14 +198,9 @@ export async function notifyMessage(deps: NotificationDeps, orgId: string, messa
   const stoppedAt = card?.agentIds.at(-1);
   const owner = !behind && !card?.forUserId && stoppedAt ? await agentOwner(deps, stoppedAt) : null;
   // The autonomy brakes' proposal card, digest and loop stop (ADR 0131) are for the person they name.
-  // Lodi's weekly card (ADR 0137 §9) is for the admin whose DM it is in.
-  const asker =
-    behind ??
-    card?.forUserId ??
-    proposalCardOf(meta)?.forUserId ??
-    autonomyNoteFor(meta) ??
-    teamWeekCardOf(meta)?.forUserId ??
-    owner;
+  const asker = unasked
+    ? null
+    : (behind ?? card?.forUserId ?? proposalCardOf(meta)?.forUserId ?? autonomyNoteFor(meta) ?? owner);
   const ownerSees =
     asker !== null &&
     asker === owner &&
@@ -230,7 +233,7 @@ export async function notifyMessage(deps: NotificationDeps, orgId: string, messa
   // answered above for the person behind them, except what nobody is waiting on: a message the agent started there on
   // someone's behalf, `send_dm`, and a reminder or a routine's report, which come while the app may be closed).
   if (channel.kind === "dm") {
-    if (message.authorType !== "person" && !meta.agentDm && !meta.routine && !meta.viaRoutine) return;
+    if (message.authorType !== "person" && !meta.agentDm && !meta.routine && !meta.viaRoutine && !unasked) return;
     const others = await db
       .select({ userId: channelMembers.userId })
       .from(channelMembers)
@@ -240,7 +243,7 @@ export async function notifyMessage(deps: NotificationDeps, orgId: string, messa
       orgId,
       userIds: to,
       kind: "dm",
-      groupKey: `dm:${message.id}`,
+      groupKey: unasked ? `${unaskedGroup(message.channelId)}${message.id}` : `dm:${message.id}`,
       actor,
       source: where,
       latest,
@@ -335,7 +338,9 @@ async function threadTitle(deps: NotificationDeps, orgId: string, rootId: string
     .select({ body: messages.body, meta: messages.meta })
     .from(messages)
     .where(and(eq(messages.orgId, orgId), eq(messages.id, rootId)));
-  return root ? notificationSnippet(readableBody(root.body, root.meta), 80) || undefined : undefined;
+  return root && !isConfidential(root.meta)
+    ? notificationSnippet(readableBody(root.body, root.meta), 80) || undefined
+    : undefined;
 }
 
 const REACTION_EMOJI: Record<string, string> = { "+1": "👍", "-1": "👎" };
@@ -384,7 +389,10 @@ export async function notifyReaction(
       ...(channel?.kind === "dm" ? { dmId: message.channelId } : {}),
       ...(channel?.kind === "channel" ? { label: channel.name } : {}),
     },
-    latest: { emojis, quote: notificationSnippet(readableBody(message.body, message.meta), 140) },
+    latest: {
+      emojis,
+      quote: isConfidential(message.meta) ? "" : notificationSnippet(readableBody(message.body, message.meta), 140),
+    },
   });
 }
 
@@ -414,8 +422,30 @@ export async function notifyQuestion(deps: NotificationDeps, q: QuestionRow) {
       ...(channel?.kind === "channel" ? { label: channel.name } : {}),
       questionId: q.id,
     },
-    latest: { text: notificationSnippet(q.text), suggestions: q.choices ?? undefined },
+    // Asked in a confidential thread (ADR 0190): what the agent typed stays on its card there.
+    latest: (await sealedPlace(deps, q.orgId, q.threadId ?? q.messageId, q.runId))
+      ? { text: "" }
+      : { text: notificationSnippet(q.text), suggestions: q.choices ?? undefined },
   });
+}
+
+/**
+ * Whether a card was asked from a confidential thread: its place (its thread's root, or itself in the main timeline)
+ * is one, or the run that asked answers in one, wherever its card was posted.
+ */
+async function sealedPlace(
+  deps: Pick<NotificationDeps, "db">,
+  orgId: string,
+  rootId: string | null,
+  runId: string | null,
+) {
+  const org = sql`${orgId}::uuid`;
+  const [row] = rowsOf<{ sealed: boolean }>(
+    await deps.db.execute(sql`select (${confidentialThreadSql(org, sql`${rootId}::uuid`)}
+      or exists (select 1 from ${schema.agentRuns} r where r.id = ${runId}::uuid and r.org_id = ${org}
+        and ${confidentialThreadSql(org, sql`r.thread_root_id`)})) as sealed`),
+  );
+  return row?.sealed === true;
 }
 
 /** Answered (by anyone) or expired: out of everyone's inbox. */
@@ -511,13 +541,14 @@ export async function notifyApproval(deps: NotificationDeps, approval: ApprovalR
       ...(approval.missionId ? { missionId: approval.missionId } : {}),
       ...(channel?.kind === "channel" ? { label: channel.name } : {}),
     },
-    latest: approvalLatest(approval),
+    latest: approvalLatest(approval, await sealedPlace(deps, approval.orgId, approval.threadRootId, approval.runId)),
   });
 }
 
-const approvalLatest = (approval: ApprovalRow) => ({
-  title: notificationSnippet(approval.title, 200),
-  text: notificationSnippet(approval.why, 200),
+/** `sealed`: asked in a confidential thread (ADR 0190), so neither its title nor its why leaves its card. */
+const approvalLatest = (approval: ApprovalRow, sealed: boolean) => ({
+  title: sealed ? "" : notificationSnippet(approval.title, 200),
+  text: sealed ? "" : notificationSnippet(approval.why, 200),
   origin: approvalOriginOf(approval.origin) ?? undefined,
   expiresAt: approval.expiresAt.toISOString(),
 });
@@ -546,9 +577,11 @@ export async function resolveApprovalNotifications(
     .orderBy(asc(approvals.createdAt));
   if (waiting.length === 0) return resolveNotifications(deps, approval.orgId, { groupKey });
   const told = await Promise.all(waiting.map(async (a) => new Set(await notifiedIds(deps.db, a))));
+  // The requests of one card share its thread.
+  const sealed = await sealedPlace(deps, approval.orgId, waiting[0]?.threadRootId ?? null, waiting[0]?.runId ?? null);
   await retargetNotifications(deps, approval.orgId, groupKey, (userId) => {
     const next = waiting.find((_, i) => told[i]?.has(userId));
-    return next ? { source: { approvalId: next.id }, latest: approvalLatest(next) } : null;
+    return next ? { source: { approvalId: next.id }, latest: approvalLatest(next, sealed) } : null;
   });
 }
 
@@ -592,9 +625,10 @@ export async function notifyNewcomers(deps: NotificationDeps, row: ApprovalRow) 
 
 // ── Issues ────────────────────────────────────────────────────────────────────
 
-/** Who follows an issue: its author, its assignee, and the people who acted on it or wrote in its conversation. */
+/** Who follows an issue: its author, its assignees, and the people who acted on it or wrote in its conversation. */
 async function issueFollowers(deps: NotificationDeps, issue: IssueRow) {
-  const [acted, wrote] = await Promise.all([
+  const [assigned, acted, wrote] = await Promise.all([
+    assigneesOfIssue(deps.db, issue.id),
     deps.db
       .selectDistinct({ userId: issueActivity.authorId })
       .from(issueActivity)
@@ -614,7 +648,7 @@ async function issueFollowers(deps: NotificationDeps, issue: IssueRow) {
   ]);
   const ids = new Set<string>([...acted.map((a) => a.userId), ...wrote.flatMap((w) => (w.userId ? [w.userId] : []))]);
   if (issue.createdByType === "person") ids.add(issue.createdById);
-  if (issue.assigneeType === "person" && issue.assigneeId) ids.add(issue.assigneeId);
+  for (const a of assigned) if (a.type === "person") ids.add(a.id);
   return taskReadersAmong(deps.db, issue.id, [...ids]);
 }
 
@@ -629,29 +663,35 @@ export type IssueNotifyActor = { type: "person"; id: string } | { type: "agent";
 const issueActor = (a: IssueNotifyActor): NotificationActor =>
   (a.type === "person" ? person(a.id) : agent(a.id)) as NotificationActor;
 
+/** The inbox group of one change of a task's status: the task and the moment it changed. */
+export const issueStatusGroup = (issueId: string, at: number) => `issue_status:${issueId}:${at}`;
+
 /**
- * After an issue changed: a new person assignee hears it (and the previous
- * one's "assigned to you" resolves); a status change reaches the followers.
+ * After an issue changed: each person put on it hears it (and the "assigned to you" of each one taken off it
+ * resolves); a status change reaches the followers.
  */
 export async function notifyIssueChanged(
   deps: NotificationDeps,
   actor: IssueNotifyActor,
-  before: Pick<IssueRow, "status" | "assigneeType" | "assigneeId"> | null,
+  before: Pick<IssueRow, "status"> | null,
   issue: IssueRow,
+  /** Who was put on the task and who was taken off it by this change. */
+  assignees: { added: readonly Assignee[]; removed: readonly Assignee[] } = { added: [], removed: [] },
 ) {
   const at = issue.updatedAt.getTime();
-  const prevPerson = before?.assigneeType === "person" ? before.assigneeId : null;
-  const nowPerson = issue.assigneeType === "person" ? issue.assigneeId : null;
-  if (prevPerson && prevPerson !== nowPerson) {
+  const people = (list: readonly Assignee[]) => list.filter((a) => a.type === "person").map((a) => a.id);
+  const left = people(assignees.removed);
+  const joined = people(assignees.added);
+  if (left.length > 0) {
     await resolveNotifications(deps, issue.orgId, {
       groupKeyPrefix: `issue_assigned:${issue.id}:`,
-      userIds: [prevPerson],
+      userIds: left,
     });
   }
-  if (nowPerson && nowPerson !== prevPerson) {
+  if (joined.length > 0) {
     await notify(deps, {
       orgId: issue.orgId,
-      userIds: await taskReadersAmong(deps.db, issue.id, [nowPerson]),
+      userIds: await taskReadersAmong(deps.db, issue.id, joined),
       kind: "issue_assigned",
       groupKey: `issue_assigned:${issue.id}:${at}`,
       actor: issueActor(actor),
@@ -664,7 +704,7 @@ export async function notifyIssueChanged(
       orgId: issue.orgId,
       userIds: await issueFollowers(deps, issue),
       kind: "issue_status",
-      groupKey: `issue_status:${issue.id}:${at}`,
+      groupKey: issueStatusGroup(issue.id, at),
       actor: issueActor(actor),
       source: issueSource(issue),
       latest: { title: issue.title, statusFrom: before.status, statusTo: issue.status },
@@ -740,8 +780,10 @@ async function notifyTaskMessage(deps: NotificationDeps, message: typeof message
   const author =
     message.authorType === "person" ? message.authorUserId : message.authorAgentId ? message.authorAgentId : null;
   if (!issue || !author) return;
-  const text = readableBody(message.body, message.meta);
-  if (!text.trim()) return;
+  // A message of a confidential thread (ADR 0190) is told with no word of it.
+  const sealed = isConfidential(message.meta);
+  const text = sealed ? "" : readableBody(message.body, message.meta);
+  if (!text.trim() && !sealed) return;
   await notifyIssueComment(deps, { type: message.authorType, id: author }, issue.id, message.id, text, {
     messageId: message.id,
   });
@@ -1305,7 +1347,7 @@ export async function resolveDashboardProposal(deps: NotificationDeps, orgId: st
 }
 
 /** Who in the organization may `permission` (ADR 0085), or only its owners. */
-const adminsOf = async (deps: NotificationDeps, orgId: string, permission: RolePermission | "owners") =>
+export const adminsOf = async (deps: NotificationDeps, orgId: string, permission: RolePermission | "owners") =>
   (
     await deps.db
       .select({ userId: organizationMembers.userId })
@@ -1520,7 +1562,7 @@ const skillWaitingGroup = (skillId: string) => `skill_update:waiting:${skillId}:
  */
 export async function notifySkillUpdate(
   deps: NotificationDeps,
-  skill: { id: string; orgId: string; name: string },
+  skill: { id: string; orgId: string; name: string; ownerUserId?: string | null },
   what:
     | { state: "updated"; version: number }
     | { state: "waiting"; hash: string; scripts: string[]; edited?: boolean }
@@ -1538,8 +1580,10 @@ export async function notifySkillUpdate(
   await notify(deps, {
     orgId: skill.orgId,
     ...(what.state === "edited" ? { actor: { type: "agent" as const, id: what.agentId } } : {}),
-    userIds:
-      to && (what.state === "updated" || what.state === "edited")
+    // A personal skill's notices are its person's alone: nobody else may read or decide it.
+    userIds: skill.ownerUserId
+      ? [skill.ownerUserId]
+      : to && (what.state === "updated" || what.state === "edited")
         ? [to]
         : [...(await adminsOf(deps, skill.orgId, "manage_agents")), ...(to && what.state === "failed" ? [to] : [])],
     kind: "skill_update",

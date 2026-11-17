@@ -1,9 +1,9 @@
-//! The Dock, like Slack's: the icon stays while the app runs (Preferences › General can take it away, back to
-//! the menu bar only), its badge shows what waits on the person (the number, or a dot when there is only
-//! unread), and it bounces once when something new waits while the app isn't in front. Windows shows the
-//! same on the taskbar button (an overlay dot) and Linux on the launcher, where the desktop supports it.
+//! The Dock: the app is always in it, like any other app (the bundle is a regular app, never a menu bar only
+//! one, so the icon needs no switch at runtime and can be kept in the Dock). Its badge shows how many
+//! notifications the person hasn't opened or that wait on them, and it bounces once when something new waits while
+//! the app isn't in front. Windows shows the same on the taskbar button (an overlay dot) and Linux on the
+//! launcher, where the desktop supports it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde_json::json;
@@ -11,32 +11,26 @@ use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
 
 use crate::main_window;
 
+#[derive(Default)]
 pub struct Dock {
-    /// The person's choice (the popover sends it at start and when it changes).
-    show: AtomicBool,
     /// What the badge showed last: `waiting` going up bounces the icon.
     last_waiting: Mutex<u32>,
 }
 
-impl Default for Dock {
-    fn default() -> Self {
-        Self { show: AtomicBool::new(true), last_waiting: Mutex::new(0) }
-    }
+/// How many the badge counts: what is unread or waits on the person.
+// The larger of the two, so an unread row that also waits isn't counted twice; a read row still waiting
+// beside other unread ones goes uncounted until the server sends that sum itself.
+pub fn count(waiting: u32, unread: u32) -> u32 {
+    waiting.max(unread)
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn shows(app: &AppHandle) -> bool {
-    app.state::<Dock>().show.load(Ordering::Relaxed)
-}
-
-/// What the badge says: the count (99+ past 99), a dot for unread only, nothing otherwise.
+/// What the badge says: the count (99+ past 99), nothing at zero.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn label(waiting: u32, unread: u32) -> Option<String> {
-    match (waiting, unread) {
-        (0, 0) => None,
-        (0, _) => Some("•".into()),
-        (n, _) if n > 99 => Some("99+".into()),
-        (n, _) => Some(n.to_string()),
+    match count(waiting, unread) {
+        0 => None,
+        n if n > 99 => Some("99+".into()),
+        n => Some(n.to_string()),
     }
 }
 
@@ -66,7 +60,7 @@ pub fn set_badge(app: &AppHandle, waiting: u32, unread: u32) {
     #[cfg(target_os = "macos")]
     let _ = window.set_badge_label(label(waiting, unread));
     #[cfg(target_os = "linux")]
-    let _ = window.set_badge_count((waiting > 0).then_some(i64::from(waiting)));
+    let _ = window.set_badge_count(Some(i64::from(count(waiting, unread))).filter(|n| *n > 0));
     #[cfg(target_os = "windows")]
     let _ = window.set_overlay_icon(label(waiting, unread).map(|_| dot()));
     let more = {
@@ -86,17 +80,6 @@ pub fn set_badge(app: &AppHandle, waiting: u32, unread: u32) {
     }
 }
 
-/// Preferences › General › "Show in the Dock".
-#[tauri::command]
-pub fn dock_set(app: AppHandle, window: tauri::Window, show: bool) -> Result<(), String> {
-    if !matches!(window.label(), "popover" | "prefs") {
-        return Err("only the app's own windows set this".into());
-    }
-    app.state::<Dock>().show.store(show, Ordering::Relaxed);
-    crate::sync_dock(&app);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,8 +87,10 @@ mod tests {
     #[test]
     fn badge_labels() {
         assert_eq!(label(0, 0), None);
-        assert_eq!(label(0, 7), Some("•".into()));
-        assert_eq!(label(3, 7), Some("3".into()));
+        assert_eq!(label(0, 7), Some("7".into()));
+        assert_eq!(label(3, 7), Some("7".into()));
+        assert_eq!(label(3, 1), Some("3".into()));
+        assert_eq!(label(0, 150), Some("99+".into()));
         assert_eq!(label(120, 0), Some("99+".into()));
     }
 }

@@ -44,10 +44,24 @@ import {
 } from "./email-codes";
 import { ConflictError, ForbiddenError, NotFoundError, TooManyError, ValidationError } from "./errors";
 import { adminIds } from "./gateway";
+import {
+  forgetStarted,
+  invitableAgentIds,
+  invitableChannelIds,
+  inviteLinkFull,
+  joinChannels,
+  linkExpiry,
+  linkMaxUses,
+  neverExpires,
+  startWith,
+  stillInvitableAgentIds,
+  stillInvitableChannelIds,
+} from "./invite-choices";
 import { assertMemberRoom } from "./limits";
 import { mailboxOf, oneLine } from "./mail/text";
 import { notify, resolveNotifications } from "./notifications";
-import { recordSignUp } from "./operator-events";
+import { recordOperatorEvent, recordSignUp } from "./operator-events";
+import { orgExists } from "./operator-paging";
 import {
   announceMembers,
   assertInviting,
@@ -55,9 +69,12 @@ import {
   findInviteLink,
   getMembership,
   INVITE_LINK_TTL_DAYS,
+  inviteLink,
   inviteLinkOpen,
   joinOrganization,
+  type Membership,
   onUserCreated,
+  removeOutsideMember,
   requirePermission,
   sendInvitation,
   spentClaimHash,
@@ -97,6 +114,8 @@ export const JOIN_REQUEST_KEEP_DAYS = 90;
 export const JOIN_NAME_MAX = 80;
 export const JOIN_NOTE_MAX = 200;
 export const JOIN_REASON_MAX = 300;
+/** Who an outside collaborator works for (ADR 0191), shown beside their name. */
+export const OUTSIDE_OF_MAX = 80;
 
 /** The outbox job that files a request whose address isn't proven (`fileJoinRequest`). */
 export const FILE_JOIN_REQUEST_JOB = "join_request.file";
@@ -115,6 +134,14 @@ const CODES_PER_SENDER = { limit: 20, windowMs: DAY_MS };
 const REQUESTS_PER_LINK = { limit: 20, windowMs: HOUR_MS };
 const group = (orgId: string) => `join_requests:${orgId}`;
 const closedLink = () => new NotFoundError("This link no longer works", "join.link_closed");
+/** A link that took all the people it may (ADR 0184): the same for every address. */
+const fullLink = () => new ConflictError("This link already took all the people it may", "join.link_full");
+/** Approving through that link: the approver's way out is a bigger maximum, unlike the asker's. */
+const fullLinkApproval = () =>
+  new ConflictError(
+    "This request's link already took all the people it may. Raise its maximum to approve.",
+    "join.link_full_approval",
+  );
 const fullError = () => new ConflictError("This workspace has many requests waiting", "join.full");
 /** A link's hour used up, by asks or by codes: everyone asking through it shares it, unlike `join.rate_limited`. */
 export const linkBusy = () =>
@@ -196,10 +223,11 @@ async function accountOf(db: Executor, userId: string) {
   return row ?? null;
 }
 
-/** An open link, by its token; else `join.link_closed`. */
+/** An open link, by its token; else `join.link_closed`, or `join.link_full` once it took all the people it may. */
 async function openLink(db: Executor, token: string, now: Date) {
   const found = await findInviteLink(db, token);
   if (!found || !inviteLinkOpen(found, now)) throw closedLink();
+  if (inviteLinkFull(found.link)) throw fullLink();
   return found;
 }
 
@@ -488,7 +516,8 @@ export async function fileJoinRequest(deps: Deps, payload: Record<string, unknow
 
 /**
  * Who to tell of a new request: the people who may answer it, as a notice merged per workspace. A suggestion names
- * who suggested it (ADR 0090), so a row of one reads "Carla suggested …", not "… asks to join".
+ * who suggested it (ADR 0090), so a row of one reads "Carla suggested …", not "… asks to join"; an outside
+ * collaborator's request (ADR 0191) who they work for.
  */
 async function noticeAdmins(
   deps: Deps,
@@ -497,7 +526,7 @@ async function noticeAdmins(
   orgName: string,
   name: string,
   now: Date,
-  suggestedBy?: string,
+  about: { suggestedBy?: string; outsideOf?: string } = {},
 ) {
   await notify(
     { ...deps, now: () => now },
@@ -508,9 +537,57 @@ async function noticeAdmins(
       groupKey: group(orgId),
       waiting: true,
       source: { label: orgName },
-      latest: { title: name, names: [name], ...(suggestedBy ? { suggestedBy } : {}) },
+      latest: {
+        title: name,
+        names: [name],
+        ...(about.suggestedBy ? { suggestedBy: about.suggestedBy } : {}),
+        ...(about.outsideOf ? { outsideOf: about.outsideOf } : {}),
+      },
     },
   ).catch(() => []);
+}
+
+/**
+ * The email that tells the people who may answer of a new request, in the transaction that files it: at most one an
+ * hour per workspace and language (ADR 0068).
+ */
+async function emailAdmins(
+  tx: Executor,
+  publicUrl: string,
+  request: Pick<RequestRow, "id" | "orgId" | "name" | "email" | "outsideOf">,
+  orgName: string,
+  admins: string[],
+  now: Date,
+) {
+  const { orgId } = request;
+  const people = admins.length
+    ? await tx
+        .select({ email: users.email, locale: users.locale })
+        .from(users)
+        .where(and(inArray(users.id, admins), accountInUse))
+    : [];
+  const hour = now.toISOString().slice(0, 13);
+  for (const g of emailsByLocale(
+    people.map((p) => ({ email: p.email, locale: emailLocale(p.locale) })),
+    `join-request:${orgId}:${hour}`,
+  )) {
+    await queueEmail(tx, {
+      orgId,
+      key: g.key,
+      to: g.to,
+      template: {
+        kind: "join_request",
+        locale: g.locale,
+        orgName,
+        name: request.name,
+        email: request.email,
+        url: answerUrl(publicUrl, orgId, request.id, "approve"),
+        denyUrl: answerUrl(publicUrl, orgId, request.id, "deny"),
+        ...(request.outsideOf ? { outsideOf: request.outsideOf } : {}),
+        ...(await modeStamp(tx, orgId)),
+      },
+    });
+  }
 }
 
 /**
@@ -545,6 +622,10 @@ async function file(
     const link = await findInviteLink(tx, { id: ask.linkId });
     if (!link || !inviteLinkOpen(link, now)) {
       if (proven) throw closedLink();
+      return null;
+    }
+    if (inviteLinkFull(link.link)) {
+      if (proven) throw fullLink();
       return null;
     }
     if (usedCode) {
@@ -612,6 +693,7 @@ async function file(
       suggestedByUserId: null,
       passwordHash: null,
       claimHash: null,
+      outsideOf: null,
       ...(proven ? kept : {}),
       verifiedAt: proven ? now : null,
       expiresAt: new Date(now.getTime() + JOIN_REQUEST_TTL_DAYS * DAY_MS),
@@ -626,33 +708,7 @@ async function file(
             .values({ orgId, ...values })
             .returning();
     if (!row) throw new Error("join request insert returned nothing");
-    const people = admins.length
-      ? await tx
-          .select({ email: users.email, locale: users.locale })
-          .from(users)
-          .where(and(inArray(users.id, admins), accountInUse))
-      : [];
-    const hour = now.toISOString().slice(0, 13);
-    for (const g of emailsByLocale(
-      people.map((p) => ({ email: p.email, locale: emailLocale(p.locale) })),
-      `join-request:${orgId}:${hour}`,
-    )) {
-      await queueEmail(tx, {
-        orgId,
-        key: g.key,
-        to: g.to,
-        template: {
-          kind: "join_request",
-          locale: g.locale,
-          orgName: link.orgName,
-          name: ask.name,
-          email: ask.email,
-          url: answerUrl(publicUrl, orgId, row.id, "approve"),
-          denyUrl: answerUrl(publicUrl, orgId, row.id, "deny"),
-          ...(await modeStamp(tx, orgId)),
-        },
-      });
-    }
+    await emailAdmins(tx, publicUrl, row, link.orgName, admins, now);
     return { orgName: link.orgName, id: row.id };
   });
   if (!filed) return { created: false, id: tookOver };
@@ -707,7 +763,9 @@ export async function joinStatus(db: Database, user: { id: string }, token: stri
  * confirmed account with it asked; false only on a server without email, or for a request typed before codes.
  * `confirmed` (read by phone builds from before `verified`): approving lets an account in at once, as
  * `approveJoinRequest` decides. `suggestedBy`: the member who suggested the person (ADR 0090), whose request came
- * through no link.
+ * through no link. `link`: the link it came through, who made it, what an approval starts on (ADR 0184) and whether
+ * it is `full`, which refuses the approval. `outsideOf`: who an outside collaborator works for (ADR 0191); null on
+ * every other request.
  */
 export async function listWaitingJoinRequests(db: Database, actorId: string, orgId: string, now = new Date()) {
   await requirePermission(db, actorId, orgId, "invite_people");
@@ -717,9 +775,11 @@ export async function listWaitingJoinRequests(db: Database, actorId: string, org
       name: requests.name,
       email: requests.email,
       note: requests.note,
+      linkId: requests.linkId,
       verified: sql<boolean>`${requests.verifiedAt} is not null or coalesce(${users.id} = ${requests.userId} and ${users.emailVerified}, false)`,
       confirmed: sql<boolean>`coalesce(${users.emailVerified} and ${accountInUse} and (${requests.verifiedAt} is not null or ${users.id} = ${requests.userId}), false)`,
       suggestedBy: sql<string | null>`(select s.name from ${users} s where s.id = ${requests.suggestedByUserId})`,
+      outsideOf: requests.outsideOf,
       createdAt: requests.createdAt,
       expiresAt: requests.expiresAt,
     })
@@ -727,12 +787,33 @@ export async function listWaitingJoinRequests(db: Database, actorId: string, org
     .leftJoin(users, eq(users.email, requests.email))
     .where(and(eq(requests.orgId, orgId), eq(requests.status, "pending"), gt(requests.expiresAt, now)))
     .orderBy(asc(requests.createdAt));
-  return rows.map((r) => ({
-    ...r,
-    verified: Boolean(r.verified),
-    confirmed: Boolean(r.confirmed),
-    suggestedBy: r.suggestedBy ?? null,
-  }));
+  const linkIds = [...new Set(rows.flatMap((r) => (r.linkId ? [r.linkId] : [])))];
+  const links = linkIds.length
+    ? await db
+        .select({ link: organizationInviteLinks, createdBy: users.name })
+        .from(organizationInviteLinks)
+        .leftJoin(users, eq(users.id, organizationInviteLinks.createdByUserId))
+        .where(and(eq(organizationInviteLinks.orgId, orgId), inArray(organizationInviteLinks.id, linkIds)))
+    : [];
+  return rows.map(({ linkId, ...r }) => {
+    const found = links.find((l) => l.link.id === linkId);
+    return {
+      ...r,
+      verified: Boolean(r.verified),
+      confirmed: Boolean(r.confirmed),
+      suggestedBy: r.suggestedBy ?? null,
+      link: found
+        ? {
+            id: found.link.id,
+            createdBy: found.createdBy ?? null,
+            roleIds: found.link.roleIds,
+            channelIds: found.link.channelIds,
+            agentIds: found.link.agentIds,
+            full: inviteLinkFull(found.link),
+          }
+        : null,
+    };
+  });
 }
 
 /** The request, locked, while it still waits; else why not. */
@@ -815,7 +896,10 @@ export type JoinApproval = { outcome: "joined" } | { outcome: "invited"; url: st
  * confirmed account with it joins at once when the address was proven; a proven ask with no account made with the
  * password it chose (ADR 0090) is made and joins at once; any other request gets an email invitation to it
  * (7 days), which opens sign-up for that address. A person who asked is told by email either way; a member's
- * suggestion gets the invitation email itself, since nobody at that address asked (ADR 0090).
+ * suggestion gets the invitation email itself, since nobody at that address asked (ADR 0090). The channels and agents
+ * they start with (ADR 0184): `start`'s, checked as an invitation's, else the link's, as far as the approver may give
+ * them at that moment. A link that took all its people takes no more approvals (`join.link_full_approval`). An
+ * outside collaborator's request (ADR 0191) lets in the account it names at once, even into a full workspace.
  */
 export async function approveJoinRequest(
   /** `secret`: `AGENTES_SECRET`, so an invitation an approval sends has a link that can be copied again. */
@@ -827,35 +911,61 @@ export async function approveJoinRequest(
   /** Roles (`org_roles`) the person gets, below the approver's own (ADR 0085). */
   roleIds: string[] = [],
   now = new Date(),
+  start: { channelIds?: string[]; agentIds?: string[] } = {},
 ): Promise<JoinApproval> {
   const actor = await requirePermission(deps.db, actorId, orgId, "invite_people");
   assertInviting(actor);
   const role = "member" as const;
   const given = await givableRoleIds(deps.db, actor, orgId, roleIds);
+  const chosen = {
+    channelIds: start.channelIds && (await invitableChannelIds(deps.db, actorId, orgId, start.channelIds, given)),
+    agentIds: start.agentIds && (await invitableAgentIds(deps.db, actor, actorId, orgId, start.agentIds, given)),
+  };
   let made: string | null = null;
+  let opened: string[] = [];
   const result = await deps.db.transaction(async (tx): Promise<JoinApproval> => {
+    // Two approvals through one link take turns, so its uses never pass its maximum.
+    await lockRequests(tx, orgId);
     const row = await waitingRequest(tx, orgId, id, now);
+    const [link] = row.linkId
+      ? await tx.select().from(organizationInviteLinks).where(eq(organizationInviteLinks.id, row.linkId))
+      : [];
+    // A request filed before its link filled waits for a bigger maximum, or a no.
+    if (link && inviteLinkFull(link)) throw fullLinkApproval();
+    const channelIds =
+      chosen.channelIds ?? (await stillInvitableChannelIds(tx, actorId, orgId, link?.channelIds ?? [], given));
+    const agentIds = chosen.agentIds ?? (await stillInvitableAgentIds(tx, actorId, orgId, link?.agentIds ?? [], given));
     let context = await answerContext(tx, orgId, actorId, row);
+    // An outside collaborator (ADR 0191): the account the operator named, whatever its address is now.
+    const outside =
+      row.outsideOf !== null && row.userId !== null ? { userId: row.userId, outsideOf: row.outsideOf } : null;
     // Someone with this address got in meanwhile: nothing to send.
-    const already = await addressIsMember(tx, orgId, row.email);
-    // Full: nobody joins, and no invitation goes out that couldn't be accepted.
-    if (!already) await assertMemberRoom(tx, orgId);
-    if (!already && !context.hasAccount && row.passwordHash && row.verifiedAt) {
+    const already = outside ? await isMember(tx, orgId, outside.userId) : await addressIsMember(tx, orgId, row.email);
+    // Full: nobody joins, and no invitation goes out that couldn't be accepted. An outside collaborator takes no seat.
+    if (!already && !outside) await assertMemberRoom(tx, orgId);
+    if (!already && !outside && !context.hasAccount && row.passwordHash && row.verifiedAt) {
       made = await makeAskedAccount(tx, row, row.passwordHash);
       // Someone signed up with the address a moment ago: theirs is read again, as an account already there.
       if (!made) context = await answerContext(tx, orgId, actorId, row);
     }
-    const joining = made ?? context.joiner;
+    const joining = outside?.userId ?? made ?? context.joiner;
     let approval: JoinApproval = { outcome: "joined" };
     let invitationId: string | null = null;
     if (!already && joining) {
-      await joinOrganization(tx, orgId, joining, role, given);
+      await joinOrganization(tx, orgId, joining, role, given, { outsideOf: outside?.outsideOf });
+      if (outside) {
+        await recordOperatorEvent(tx, { type: "outside_access.granted", orgId, data: { userId: outside.userId } });
+      }
+      await joinChannels(tx, orgId, joining, channelIds);
+      opened = await startWith(tx, { orgId, userId: joining, giverId: actorId, agentIds });
     } else if (!already) {
       const sent = await sendInvitation(tx, {
         orgId,
         email: row.email,
         role,
         roleIds: given,
+        channelIds,
+        agentIds,
         invitedBy: actorId,
         ownersOk: can(actor, "manage_owners"),
         secret: deps.secret,
@@ -895,7 +1005,13 @@ export async function approveJoinRequest(
       actor: { type: "person", id: actorId },
       action: "join_request.approved",
       target: { type: "join_request", id: row.id },
-      details: { roleIds: given, joined: approval.outcome === "joined" },
+      details: {
+        roleIds: given,
+        channelIds,
+        agentIds,
+        joined: approval.outcome === "joined",
+        ...(outside ? { outsideOf: outside.outsideOf } : {}),
+      },
     });
     if (!already && row.suggestedByUserId) {
       // Nobody at the address asked (ADR 0090): no answer, only the invitation, as anyone invited gets it.
@@ -922,7 +1038,7 @@ export async function approveJoinRequest(
           orgName: context.orgName,
           approverName: context.approverName,
           role,
-          crew: await emailCrew(tx, orgId),
+          crew: await emailCrew(tx, orgId, agentIds),
           // The invitation as its own email would carry it: accepted from here, the address counts as confirmed.
           url:
             approval.outcome !== "invited"
@@ -937,7 +1053,8 @@ export async function approveJoinRequest(
     return approval;
   });
   if (made) await welcomeAccount(deps.db, made);
-  if (result.outcome === "joined") await announceMembers(deps.pubsub, orgId);
+  forgetStarted(orgId, opened);
+  if (result.outcome === "joined") await announceMembers(deps.pubsub, orgId, opened);
   await settleJoinRequests(deps, orgId, now);
   return result;
 }
@@ -972,6 +1089,9 @@ export async function denyJoinRequest(
       target: { type: "join_request", id: row.id },
       details: { withReason: why !== null },
     });
+    if (row.outsideOf !== null && row.userId) {
+      await recordOperatorEvent(tx, { type: "outside_access.denied", orgId, data: { userId: row.userId } });
+    }
     if (row.suggestedByUserId) return;
     await queueEmail(tx, {
       orgId,
@@ -993,7 +1113,8 @@ export async function denyJoinRequest(
 
 /**
  * The workspace's active invitation links (`manage_members`), newest first: `token` when it can be shown again
- * (`inviteLinkToken`), null for a link made before that; who made it, and how many requests through it wait.
+ * (`inviteLinkToken`), null for a link made before that; who made it, how many requests through it wait, and what it
+ * gives (ADR 0184): its cargos, channels and agents, its maximum and the people approved through it so far.
  */
 export async function listInviteLinks(db: Database, secret: string, actorId: string, orgId: string, now = new Date()) {
   await requirePermission(db, actorId, orgId, "invite_people");
@@ -1032,11 +1153,155 @@ export async function listInviteLinks(db: Database, secret: string, actorId: str
       id: link.id,
       token: sha256(token) === link.tokenHash ? token : null,
       expiresAt: link.expiresAt,
+      neverExpires: neverExpires(link.expiresAt),
       createdAt: link.createdAt,
       createdBy: createdBy ?? null,
+      createdByUserId: link.createdByUserId,
       waiting: waiting.get(link.id) ?? 0,
+      plain: link.plain,
+      roleIds: link.roleIds,
+      channelIds: link.channelIds,
+      agentIds: link.agentIds,
+      maxUses: link.maxUses,
+      uses: link.uses,
     };
   });
+}
+
+/** What a link gives and how long it works (ADR 0184): each part optional, an omitted one left as it is. */
+export interface InviteLinkChoices {
+  roleIds?: string[];
+  channelIds?: string[];
+  agentIds?: string[];
+  /** One of `INVITE_LINK_MAX_USES`, or null for no limit. */
+  maxUses?: number | null;
+  /** One of `INVITE_LINK_TTLS`' keys, counted from now. */
+  expiresIn?: string;
+}
+
+/** The choices a link starts with when none are given: what the plain workspace link is. */
+const atDefaults = (c: InviteLinkChoices) =>
+  !c.roleIds?.length &&
+  !c.channelIds?.length &&
+  !c.agentIds?.length &&
+  (c.maxUses ?? null) === null &&
+  (c.expiresIn ?? "30d") === "30d";
+
+/** Each choice checked for the actor as an invitation's (`givableRoleIds`, `invitableChannelIds`, `invitableAgentIds`). */
+async function checkedChoices(
+  db: Database,
+  actor: Membership,
+  actorId: string,
+  orgId: string,
+  c: InviteLinkChoices,
+  current: { roleIds: string[] },
+  now: Date,
+) {
+  const roleIds = c.roleIds ? await givableRoleIds(db, actor, orgId, c.roleIds) : current.roleIds;
+  return {
+    ...(c.roleIds ? { roleIds } : {}),
+    ...(c.channelIds ? { channelIds: await invitableChannelIds(db, actorId, orgId, c.channelIds, roleIds) } : {}),
+    ...(c.agentIds ? { agentIds: await invitableAgentIds(db, actor, actorId, orgId, c.agentIds, roleIds) } : {}),
+    ...(c.maxUses !== undefined ? { maxUses: linkMaxUses(c.maxUses) } : {}),
+    ...(c.expiresIn !== undefined ? { expiresAt: linkExpiry(c.expiresIn, now) } : {}),
+  };
+}
+
+/**
+ * A link with choices (ADR 0184): the cargos, channels and agents an approval starts on, how long it works and how
+ * many people it takes, each checked for whoever makes it as an invitation's. Many links can be live at once, each
+ * listed. Choices at the defaults are the workspace's plain link (`inviteLink`), which then works 30 days from now.
+ * Whoever opens any of them still only asks to join (ADR 0068).
+ */
+export async function createInviteLink(
+  db: Database,
+  secret: string,
+  actorId: string,
+  orgId: string,
+  choices: InviteLinkChoices,
+  now = new Date(),
+) {
+  if (atDefaults(choices)) return inviteLink(db, secret, actorId, orgId, now, { renew: true });
+  const actor = await requirePermission(db, actorId, orgId, "invite_people");
+  assertInviting(actor);
+  const checked = await checkedChoices(db, actor, actorId, orgId, choices, { roleIds: [] }, now);
+  const id = crypto.randomUUID();
+  const token = inviteLinkToken(secret, id);
+  const [link] = await db
+    .insert(organizationInviteLinks)
+    .values({
+      id,
+      orgId,
+      role: "member",
+      tokenHash: sha256(token),
+      createdByUserId: actorId,
+      expiresAt: new Date(now.getTime() + INVITE_LINK_TTL_DAYS * DAY_MS),
+      plain: false,
+      ...checked,
+    })
+    .returning();
+  if (!link) throw new Error("invite link insert returned nothing");
+  await recordAudit(db, {
+    orgId,
+    actor: { type: "person", id: actorId },
+    action: "invite_link.created",
+    target: { type: "invite_link", id },
+    details: linkDetails(link),
+  });
+  await recordOperatorEvent(db, { type: "invitation.created", orgId, userId: actorId, data: { link: true } });
+  return { link, token, made: true };
+}
+
+const linkDetails = (link: typeof organizationInviteLinks.$inferSelect) => ({
+  roleIds: link.roleIds,
+  channelIds: link.channelIds,
+  agentIds: link.agentIds,
+  maxUses: link.maxUses,
+  expiresAt: link.expiresAt.toISOString(),
+});
+
+/**
+ * Changes what an active link gives (ADR 0184), each given choice checked as when making one; its address stays the
+ * same. `expiresIn` counts from now. A link changed this way is no longer the workspace's plain one.
+ */
+export async function editInviteLink(
+  db: Database,
+  actorId: string,
+  orgId: string,
+  linkId: string,
+  choices: InviteLinkChoices,
+  now = new Date(),
+) {
+  const actor = await requirePermission(db, actorId, orgId, "invite_people");
+  assertInviting(actor);
+  const [current] = await db
+    .select()
+    .from(organizationInviteLinks)
+    .where(
+      and(
+        eq(organizationInviteLinks.orgId, orgId),
+        eq(organizationInviteLinks.id, linkId),
+        isNull(organizationInviteLinks.revokedAt),
+      ),
+    );
+  // An expired link can still change: a full one's maximum grows so its waiting requests can be approved. It stays
+  // expired unless `expiresIn` is sent, as renewing it would.
+  if (!current) throw new NotFoundError("Invitation link not found");
+  const checked = await checkedChoices(db, actor, actorId, orgId, choices, current, now);
+  const [link] = await db
+    .update(organizationInviteLinks)
+    .set({ ...checked, plain: false })
+    .where(eq(organizationInviteLinks.id, linkId))
+    .returning();
+  if (!link) throw new NotFoundError("Invitation link not found");
+  await recordAudit(db, {
+    orgId,
+    actor: { type: "person", id: actorId },
+    action: "invite_link.changed",
+    target: { type: "invite_link", id: linkId },
+    details: linkDetails(link),
+  });
+  return link;
 }
 
 /** Gives an active invitation link 30 more days from now (ADR 0090): the same link, so whoever has it keeps it. */
@@ -1174,6 +1439,7 @@ export async function suggestPerson(
       suggestedByUserId: actorId,
       passwordHash: null,
       claimHash: null,
+      outsideOf: null,
       verifiedAt: null,
       expiresAt: new Date(now.getTime() + JOIN_REQUEST_TTL_DAYS * DAY_MS),
       createdAt: now,
@@ -1196,7 +1462,7 @@ export async function suggestPerson(
     });
     return saved;
   });
-  await noticeAdmins(deps, orgId, admins, org?.name ?? "", email, now, me?.name || undefined);
+  await noticeAdmins(deps, orgId, admins, org?.name ?? "", email, now, me?.name ? { suggestedBy: me.name } : {});
   return { id: row.id };
 }
 
@@ -1233,6 +1499,153 @@ export async function cancelSuggestion(deps: Deps, actorId: string, orgId: strin
     .returning({ id: requests.id });
   if (!row) throw new NotFoundError("This suggestion doesn't wait anymore");
   await settleJoinRequests(deps, orgId, now);
+}
+
+/**
+ * The operator API asks to let an account in as an outside collaborator (ADR 0191): someone working for the workspace
+ * from outside it (`outsideOf`: who they work for), who takes no seat. It files a request the people who may invite
+ * answer as any other, and tells them the way `askToJoin` does. Asking again while it waits returns the request as it
+ * is. Refused for someone already in (`join.member`), and while another request waits for their address
+ * (`join.waiting`): that one is answered first.
+ */
+export async function requestOutsideAccess(
+  /** `publicUrl`: this server's address, for the links in the email to the people who answer. */
+  deps: Deps & { publicUrl: string },
+  input: { orgId: string; userId: string; outsideOf: string; note?: string | null },
+  now = new Date(),
+) {
+  const { db } = deps;
+  const { orgId, userId } = input;
+  const outsideOf = input.outsideOf.trim();
+  if (outsideOf.length < 1 || outsideOf.length > OUTSIDE_OF_MAX) {
+    throw new ValidationError(`Who they work for takes 1 to ${OUTSIDE_OF_MAX} characters`);
+  }
+  const [org] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId));
+  if (!org) throw new NotFoundError("No workspace with this id");
+  const account = await accountOf(db, userId);
+  if (!account) throw new NotFoundError("No account with this id");
+  const email = account.email.toLowerCase();
+  const name = oneLine(account.name, JOIN_NAME_MAX) || oneLine(email.split("@")[0] ?? "", JOIN_NAME_MAX);
+  const admins = await adminIds(db, orgId, "invite_people");
+  const filed = await db.transaction(async (tx) => {
+    await lockRequests(tx, orgId);
+    if (await isMember(tx, orgId, userId)) {
+      throw new ConflictError("This person is already in this workspace", "join.member");
+    }
+    const [latest] = await tx
+      .select()
+      .from(requests)
+      .where(and(eq(requests.orgId, orgId), eq(requests.email, email)))
+      .orderBy(desc(requests.createdAt))
+      .limit(1);
+    if (latest && isWaiting(latest, now)) {
+      if (latest.outsideOf === null) {
+        throw new ConflictError("A request to join already waits for this address", "join.waiting");
+      }
+      return { row: latest, created: false };
+    }
+    const values = {
+      linkId: null,
+      userId,
+      email,
+      name,
+      note: oneLine(input.note ?? "", JOIN_NOTE_MAX) || null,
+      locale: account.locale,
+      status: "pending" as const,
+      role: null,
+      reason: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      invitationId: null,
+      suggestedByUserId: null,
+      passwordHash: null,
+      claimHash: null,
+      outsideOf,
+      // The operator vouches for who they are: nothing is left for the address to prove.
+      verifiedAt: now,
+      expiresAt: new Date(now.getTime() + JOIN_REQUEST_TTL_DAYS * DAY_MS),
+      createdAt: now,
+    };
+    // A request that ran out still holds the address's one waiting slot: it starts over.
+    const [row] =
+      latest?.status === "pending"
+        ? await tx.update(requests).set(values).where(eq(requests.id, latest.id)).returning()
+        : await tx
+            .insert(requests)
+            .values({ orgId, ...values })
+            .returning();
+    if (!row) throw new Error("join request insert returned nothing");
+    await emailAdmins(tx, deps.publicUrl, row, org.name, admins, now);
+    return { row, created: true };
+  });
+  if (filed.created) await noticeAdmins(deps, orgId, admins, org.name, name, now, { outsideOf });
+  return filed.row;
+}
+
+/**
+ * The operator API ends an account's outside access to a workspace (ADR 0191): its request still waiting closes, and
+ * an outside collaborator is taken out as anyone removed is (`removeOutsideMember`). Never an ordinary member
+ * (`outside_access.member`). With neither, nothing changes.
+ */
+export async function endOutsideAccess(deps: Deps, orgId: string, userId: string, now = new Date()) {
+  if (!(await orgExists(deps.db, orgId))) throw new NotFoundError("No workspace with this id");
+  const closed = await deps.db.transaction(async (tx) => {
+    await lockRequests(tx, orgId);
+    const rows = await tx
+      .update(requests)
+      .set({ status: "closed", decidedAt: now, passwordHash: null })
+      .where(
+        and(
+          eq(requests.orgId, orgId),
+          eq(requests.userId, userId),
+          eq(requests.status, "pending"),
+          isNotNull(requests.outsideOf),
+        ),
+      )
+      .returning({ id: requests.id });
+    if (rows.length > 0) await recordOperatorEvent(tx, { type: "outside_access.ended", orgId, data: { userId } });
+    return rows.length > 0;
+  });
+  if (closed) await settleJoinRequests(deps, orgId, now);
+  const removed = await removeOutsideMember(deps.db, orgId, userId, { pubsub: deps.pubsub });
+  return { closed, removed };
+}
+
+/**
+ * A workspace's outside collaborators (ADR 0191), for the operator API: the requests still waiting for an answer, then
+ * the people in, each oldest first. Null: no such workspace.
+ */
+export async function listOutsideAccess(db: Database, orgId: string, now = new Date()) {
+  if (!(await orgExists(db, orgId))) return null;
+  // ponytail: one page, a workspace has a handful; keyset pages like the members' read if one ever has hundreds.
+  const [waiting, members] = await Promise.all([
+    db
+      .select({ userId: requests.userId, outsideOf: requests.outsideOf, since: requests.createdAt })
+      .from(requests)
+      .where(
+        and(
+          eq(requests.orgId, orgId),
+          eq(requests.status, "pending"),
+          gt(requests.expiresAt, now),
+          isNotNull(requests.outsideOf),
+        ),
+      )
+      .orderBy(asc(requests.createdAt)),
+    db
+      .select({
+        userId: organizationMembers.userId,
+        outsideOf: organizationMembers.outsideOf,
+        since: organizationMembers.createdAt,
+      })
+      .from(organizationMembers)
+      .where(and(eq(organizationMembers.orgId, orgId), isNotNull(organizationMembers.outsideOf)))
+      .orderBy(asc(organizationMembers.createdAt)),
+  ]);
+  const people = (rows: typeof waiting, state: "pending" | "member") =>
+    rows.flatMap((r) =>
+      r.userId && r.outsideOf ? [{ userId: r.userId, outsideOf: r.outsideOf, state, since: r.since }] : [],
+    );
+  return [...people(waiting, "pending"), ...people(members, "member")];
 }
 
 /**

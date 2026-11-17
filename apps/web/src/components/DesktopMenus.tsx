@@ -2,7 +2,7 @@ import { useNotificationCount } from "@agenteschat/client";
 import { workspaceLabel, workspaceNotes } from "@agenteschat/client/lib/deletion";
 import { MenuAt, MenuHeading, MenuItem, MenuReactions, MenuSeparator } from "@agenteschat/ui";
 import { useRouter } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { NEW_AGENT_EVENT } from "@/components/new-agent/NewAgentDialog";
 import {
@@ -17,6 +17,7 @@ import {
 import { inDesktopApp, thisMac } from "@/lib/desktop";
 import { useToast } from "@/lib/toast";
 import { openPalette } from "./CommandMenu";
+import { useNavDrawer } from "./NavDrawer";
 import { useOrg } from "./org-context";
 import { NEW_CHANNEL_EVENT, toggleSidebar } from "./Sidebar";
 
@@ -157,6 +158,10 @@ const ECHO_MS = 400;
 export function MenuBarActions({ orgId }: { orgId: string }) {
   const { t, i18n } = useTranslation();
   const router = useRouter();
+  // A window narrow enough for the drawer: View → sidebar opens and closes it, as the title bar's button does.
+  const navDrawer = useNavDrawer();
+  const drawer = useRef(navDrawer);
+  drawer.current = navDrawer;
   useEffect(() => {
     const keyed = new Map<string, number>();
     const onKey = (e: KeyboardEvent) => {
@@ -172,7 +177,7 @@ export function MenuBarActions({ orgId }: { orgId: string }) {
       search: openPalette,
       back: () => router.history.back(),
       forward: () => router.history.forward(),
-      toggleSidebar,
+      toggleSidebar: () => (drawer.current?.compact ? drawer.current.toggle() : toggleSidebar()),
       goHome: to(org),
       goWaiting: to(`${org}/notifications`),
       goTasks: to(`${org}/issues`),
@@ -204,7 +209,7 @@ export function MenuBarActions({ orgId }: { orgId: string }) {
     void thisMac.orgs(orgList).catch(() => {});
   }, [orgsKey]);
 
-  // The Dock's badge: what waits on the person in this organization (a dot for unread only).
+  // The Dock's badge: how many notifications in this organization are unread or wait on the person.
   const counts = useNotificationCount(orgId).data;
   const waiting = counts?.waiting ?? 0;
   const unread = counts?.unread ?? 0;

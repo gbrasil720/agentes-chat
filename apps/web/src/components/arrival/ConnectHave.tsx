@@ -1,12 +1,19 @@
-import type { PlanUsage } from "@agenteschat/client";
-import { accountAbout, accountTitle, type ExistingAi } from "@agenteschat/client/lib/ai-accounts";
+import type { MachineAccount, PlanUsage } from "@agenteschat/client";
+import {
+  accountAbout,
+  accountTitle,
+  type ExistingAi,
+  unnamedAccount,
+  withSub,
+} from "@agenteschat/client/lib/ai-accounts";
 import { namesText } from "@agenteschat/client/lib/format";
 import { type PlanChoice, planOfAccount } from "@agenteschat/client/lib/no-ai";
 import { keyLine } from "@agenteschat/client/lib/providers";
-import { Icon, ProviderLogo, planState, Radio, RadioGroup } from "@agenteschat/ui";
+import { Button, Icon, Input, ProviderLogo, planState, Radio, RadioGroup } from "@agenteschat/ui";
 import type { TFunction } from "i18next";
 import { type CSSProperties, Fragment, type ReactNode, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useRenameAccount } from "@/hooks/useRenameAccount";
 import { planWord } from "@/lib/plan-usage";
 
 /** A row's id in the list: an account's or a key's. */
@@ -26,6 +33,8 @@ export interface HaveItem {
   whose: string;
   /** Its group, by owner: `mine`, `keys`, or another owner's key. */
   group: { key: string; label: string };
+  /** Its AI (Claude, ChatGPT…, or the API keys): its group in a list by AI (`HaveList.byAi`). */
+  ai?: { key: string; label: string };
   mark: ReactNode;
   /** Its plan's limits; null where nothing says (a key). */
   usage: PlanUsage | null;
@@ -35,6 +44,13 @@ export interface HaveItem {
   signIn?: boolean;
   /** A workspace key: after the plans. */
   isKey?: boolean;
+  /** The viewer's own account with no name of theirs and no email ("Unnamed account"): its title reads quieter. */
+  unnamed?: boolean;
+  /**
+   * The viewer's own account: the pencil after its title changes its name in the row itself. `value`: the name its
+   * owner gave it, empty while it has the automatic one.
+   */
+  rename?: { value: string; placeholder: string; save: (name: string) => Promise<unknown> };
 }
 
 /** How much of its plan an item has used, and whether it is near or at its limit; null where nothing says. */
@@ -83,8 +99,35 @@ export const HAVE_SHOWN = 3;
 
 const firstName = (name: string | null | undefined) => name?.split(" ")[0] ?? "";
 
+/** Saves an account's new name (`useRenameAccount`). */
+export type RenameAccount = (machineId: string, accountId: string, name: string) => Promise<unknown>;
+
+/**
+ * The pencil of the viewer's own account on `machineId` (`HaveItem.rename`): the name they gave it to start from, else
+ * an empty field showing its email, or an example where it has none.
+ */
+export const renameOf = (
+  t: TFunction,
+  a: Pick<MachineAccount, "id" | "label" | "named" | "email" | "mine">,
+  machineId: string | undefined,
+  rename: RenameAccount | undefined,
+): HaveItem["rename"] =>
+  a.mine && machineId && rename
+    ? {
+        value: a.named === true ? a.label : "",
+        placeholder: a.email ?? t("aiAccounts.rename.placeholder"),
+        save: (name) => rename(machineId, a.id, name),
+      }
+    : undefined;
+
 /** What the person already has (`ExistingAi`), as the list's rows. */
-function itemOf(t: TFunction, r: ExistingAi, agentName: string, dims: (choice: PlanChoice) => boolean): HaveItem {
+function itemOf(
+  t: TFunction,
+  r: ExistingAi,
+  agentName: string,
+  dims: (choice: PlanChoice) => boolean,
+  rename?: RenameAccount,
+): HaveItem {
   if (r.kind === "key") {
     return {
       id: haveId(r),
@@ -92,7 +135,7 @@ function itemOf(t: TFunction, r: ExistingAi, agentName: string, dims: (choice: P
       about: keyLine(t, r.key),
       whose: t("connectAi.chat.keys"),
       group: { key: "keys", label: t("connectAi.chat.keys") },
-      mark: <Icon name="key" size={16} className="arrival-have__mark" />,
+      mark: <Icon name="key" size={20} className="arrival-have__mark" />,
       usage: null,
       isKey: true,
     };
@@ -104,12 +147,14 @@ function itemOf(t: TFunction, r: ExistingAi, agentName: string, dims: (choice: P
     : t("agentPage.work.brain.accountOf", { name: firstName(a.ownerName) });
   return {
     id: haveId(r),
-    title: accountTitle(a),
+    title: accountTitle(t, a),
+    unnamed: unnamedAccount(a),
+    rename: renameOf(t, a, "machineId" in a && typeof a.machineId === "string" ? a.machineId : undefined, rename),
     // In its owner's group, who else thinks with it; someone else's says nothing more there.
     about: !a.mine
       ? undefined
       : others.length > 0 && a.shared === true
-        ? t("agentPage.work.brain.accountAlso", { agents: namesText(t, others, 2) })
+        ? withSub(a, t("agentPage.work.brain.accountAlso", { agents: namesText(t, others, 2) }))
         : accountAbout(t, r.choice, agentName),
     whose,
     group: a.mine ? { key: "mine", label: t("connectAi.chat.mine") } : { key: `owner:${a.ownerId}`, label: whose },
@@ -119,8 +164,9 @@ function itemOf(t: TFunction, r: ExistingAi, agentName: string, dims: (choice: P
 }
 
 /**
- * One row. In a list (`RadioGroup`) its radio picks it; `still`: the one in use, shown alone with its dot, nothing to
- * pick. `whose`: it says whose it is instead of the line about it (a list of mixed owners).
+ * One row. In a list (`RadioGroup`) it is a radio, its border alone marking the one picked (no dot); `still`: the one
+ * in use, shown alone, nothing to pick. `whose`: it says whose it is instead of the line about it (a list of mixed
+ * owners).
  */
 export function HaveRow({
   item,
@@ -140,16 +186,38 @@ export function HaveRow({
 }) {
   const { t, i18n } = useTranslation();
   const dom = useId();
+  const [renaming, setRenaming] = useState(false);
   const off = disabled || item.off === true;
   const state = roomOf(item.usage);
   const about = whose ? item.whose : item.about;
   const shownWord = word !== undefined ? word : item.usage ? planWord(t, i18n.language, item.usage) : null;
   const used = state ? Math.min(100, Math.round(state.used)) : 0;
+  if (renaming && item.rename) return <RenameRow item={item} onDone={() => setRenaming(false)} />;
   const body = (
     <>
       {item.mark}
       <span className="arrival-have__text">
-        <span className="arrival-have__title">{item.title}</span>
+        <span className="arrival-have__head">
+          <span className="arrival-have__title" data-unnamed={item.unnamed ? "" : undefined}>
+            {item.title}
+          </span>
+          {item.rename && !disabled && (
+            <button
+              type="button"
+              className="arrival-have__edit"
+              aria-label={t("aiAccounts.rename.action", { label: item.title })}
+              title={t("aiAccounts.rename.action", { label: item.title })}
+              onClick={(e) => {
+                // In the row's label: the click opens the name, never picks the row.
+                e.preventDefault();
+                e.stopPropagation();
+                setRenaming(true);
+              }}
+            >
+              <Icon name="edit" size={14} />
+            </button>
+          )}
+        </span>
         {about && <span className="arrival-have__line">{about}</span>}
         {shownWord && (
           <span className="arrival-have__line" data-plan={state?.state}>
@@ -174,9 +242,6 @@ export function HaveRow({
   if (still) {
     return (
       <div className="arrival-have__row" data-state="checked" data-still="">
-        <span className="ac-radio" data-state="checked" aria-hidden="true">
-          <span className="ac-radio__dot" data-state="checked" />
-        </span>
         {body}
       </div>
     );
@@ -194,10 +259,75 @@ export function HaveRow({
   );
 }
 
+/** The row while its account's name is changed (`HaveItem.rename`): the field and Save where the name stood. */
+function RenameRow({ item, onDone }: { item: HaveItem; onDone: () => void }) {
+  const { t } = useTranslation();
+  const rename = item.rename;
+  const [name, setName] = useState(rename?.value ?? "");
+  const [busy, setBusy] = useState(false);
+  if (!rename) return null;
+  const clean = name.trim();
+  const save = async () => {
+    if (!clean || clean === rename.value) return onDone();
+    setBusy(true);
+    try {
+      await rename.save(clean);
+      onDone();
+    } catch {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="arrival-have__row" data-state="unchecked" data-renaming="">
+      {item.mark}
+      <span className="arrival-have__text">
+        <form
+          className="arrival-have__rename"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          <Input
+            value={name}
+            autoFocus
+            maxLength={40}
+            placeholder={rename.placeholder}
+            aria-label={t("aiAccounts.rename.label")}
+            disabled={busy}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <Button type="submit" size="sm" variant="primary" loading={busy} disabled={!clean}>
+            {t("common.save")}
+          </Button>
+        </form>
+        {item.about && <span className="arrival-have__line">{item.about}</span>}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * A plan that can't be picked now, with why and its way out (`why`). Only its mark and name are dimmed: the reason
+ * and its link stay readable.
+ */
+export function HaveOffRow({ item, why }: { item: Pick<HaveItem, "title" | "mark">; why: ReactNode }) {
+  return (
+    <div className="arrival-have__row" data-disabled="" data-why="">
+      {item.mark}
+      <span className="arrival-have__text">
+        <span className="arrival-have__title">{item.title}</span>
+        <span className="arrival-have__why">{why}</span>
+      </span>
+    </div>
+  );
+}
+
 /**
  * Rows to pick one from (`HaveItem`): few are grouped (the person's, the workspace's keys, each other owner's); many
  * show the three with most room, each saying whose it is, and `all` lists every one under a search, by owner, those at
- * their limit last. `pinned`: a group over the rest whatever their number (the one in use), never in `all`.
+ * their limit last. `byAi`: those groups go by AI instead of by owner. `pinned`: a group over the rest whatever their
+ * number (the one in use), never in `all`.
  */
 export function HaveList({
   items,
@@ -208,6 +338,7 @@ export function HaveList({
   disabled = false,
   pinned,
   label,
+  byAi = false,
 }: {
   items: readonly HaveItem[];
   value: string | undefined;
@@ -217,6 +348,8 @@ export function HaveList({
   disabled?: boolean;
   pinned?: { label: string; items: readonly HaveItem[] };
   label: string;
+  /** Its groups by AI (Claude, ChatGPT…, the API keys last) instead of by owner, a row with nothing more to say saying whose it is. */
+  byAi?: boolean;
 }) {
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
@@ -235,6 +368,12 @@ export function HaveList({
       else out.push({ key, label, rows: [i] });
     };
     const open = all ? list.filter((i) => !limited(i)) : list;
+    if (byAi) {
+      for (const i of open) if (i.ai && !i.isKey) into(i.ai.key, i.ai.label, i);
+      for (const i of open) if (!i.ai || i.isKey) into(i.ai?.key ?? i.group.key, i.ai?.label ?? i.group.label, i);
+      if (all) for (const i of list.filter(limited)) into("limit", t("connectAi.chat.atLimit"), i);
+      return out;
+    }
     for (const i of open) if (i.group.key === "mine") into(i.group.key, i.group.label, i);
     for (const i of open) if (i.group.key === "keys") into(i.group.key, i.group.label, i);
     for (const i of open) if (i.group.key !== "mine" && i.group.key !== "keys") into(i.group.key, i.group.label, i);
@@ -246,7 +385,7 @@ export function HaveList({
       {groups().map((g) => (
         <Fragment key={g.key}>
           <p className="arrival-opts__label">{g.label}</p>
-          {g.rows.map((i) => row(i, g.key === "limit"))}
+          {g.rows.map((i) => row(i, g.key === "limit" || (byAi && !i.about)))}
         </Fragment>
       ))}
     </>
@@ -343,9 +482,10 @@ export function ConnectHave({
   disabled?: boolean;
 }) {
   const { t } = useTranslation();
+  const rename = useRenameAccount();
   return (
     <HaveList
-      items={rows.map((r) => itemOf(t, r, agentName, dims))}
+      items={rows.map((r) => itemOf(t, r, agentName, dims, rename))}
       value={value}
       onChange={onChange}
       all={all}
