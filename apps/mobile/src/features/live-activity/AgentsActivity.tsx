@@ -21,7 +21,7 @@ import type { IslandProps } from "./props";
  * It runs in the widget extension's own runtime (the `widget` directive): no hooks, no state, and nothing from this
  * module's scope but the components it imports, so its colors and helpers live inside it.
  */
-function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvironment) {
+function AgentsActivityLayout(props: IslandProps, environment: LiveActivityEnvironment) {
   "widget";
   const AMBER = "#ffb340";
   const GREEN = "#34c759";
@@ -30,6 +30,11 @@ function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvi
   const first = agents[0];
   const tone = props?.tone ?? "working";
   const accent = tone === "waiting" ? AMBER : tone === "done" ? GREEN : "#ffffff";
+  // Past its stale date with no update: the server may not have reached it (a push-started activity whose token never
+  // came back), so the work may be over. No timer and no "working", the server's line for it instead.
+  const stale = environment?.isStale === true && tone !== "done";
+  const step = (agent: IslandProps["agents"][number] | undefined) =>
+    stale ? (props?.stale ?? "") : (agent?.step ?? "");
 
   // A face: the agent's picture the app left in the widgets directory, or a plain dot in its place.
   const face = (agent: IslandProps["agents"][number] | undefined, size: number) =>
@@ -40,7 +45,7 @@ function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvi
     );
   // How long an agent has been at it, counted by the system; a request or "done" says so instead.
   const clock = (agent: IslandProps["agents"][number] | undefined, size: number) =>
-    agent && agent.state === "working" ? (
+    agent && agent.state === "working" && !stale ? (
       <Text
         date={new Date(agent.since)}
         dateStyle="timer"
@@ -52,7 +57,7 @@ function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvi
       </Text>
     );
   const trailing = (size: number) =>
-    props?.trailing ? (
+    props?.trailing && !stale ? (
       <Text modifiers={[font({ size, weight: "semibold" }), foregroundStyle(accent), lineLimit(1)]}>
         {props.trailing}
       </Text>
@@ -65,10 +70,10 @@ function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvi
       {face(agent, size)}
       <VStack alignment="leading" spacing={1}>
         <Text modifiers={[font({ size: 15, weight: "semibold" }), lineLimit(1)]}>{agent.name}</Text>
-        <Text modifiers={[font({ size: 14 }), foregroundStyle(DIM), lineLimit(2)]}>{agent.step}</Text>
+        <Text modifiers={[font({ size: 14 }), foregroundStyle(DIM), lineLimit(2)]}>{step(agent)}</Text>
       </VStack>
       <Spacer />
-      {agent.state === "waiting" ? (
+      {agent.state === "waiting" && !stale ? (
         <Text modifiers={[font({ size: 13, weight: "semibold" }), foregroundStyle(AMBER)]}>{props.trailing ?? ""}</Text>
       ) : (
         clock(agent, 15)
@@ -110,7 +115,7 @@ function AgentsActivityLayout(props: IslandProps, _environment: LiveActivityEnvi
         </VStack>
       ) : (
         <Text modifiers={[font({ size: 15 }), lineLimit(2), widgetURL(props?.url ?? "agenteschat://island")]}>
-          {first?.step ?? ""}
+          {step(first)}
         </Text>
       ),
   };

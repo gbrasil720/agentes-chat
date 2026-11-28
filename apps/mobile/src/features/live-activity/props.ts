@@ -28,6 +28,8 @@ export interface IslandProps {
   more: number;
   /** Where a tap goes: agenteschat://island?org=…&channel=…[&thread=…][&message=…]. */
   url: string;
+  /** Shown in place of each step, without timers, once the content is out of date (iOS's `isStale`). */
+  stale?: string;
 }
 
 /** Where a tap on the island lands: the conversation (and its thread, and the message) it points at. */

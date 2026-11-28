@@ -58,6 +58,14 @@ describe("the agents' Live Activity (ADR 0210)", () => {
       expect([region, layout.includes(region)]).toEqual([region, true]);
   });
 
+  test("past its stale date the layout drops the timer and the step for the server's stale line", () => {
+    // The server can't end an activity whose token never came back: stale is how a finished run stops showing at work.
+    const layout = src("src/features/live-activity/AgentsActivity.tsx");
+    expect(layout).toContain('const stale = environment?.isStale === true && tone !== "done";');
+    expect(layout).toContain('agent.state === "working" && !stale');
+    expect(layout).toContain('props?.stale ?? ""');
+  });
+
   test("the app registers its push-to-start token and every running activity's token, and stops when off", () => {
     const hook = src("src/features/live-activity/useLiveActivity.ios.ts");
     expect(hook).toContain("void api.push.liveActivityOff(id).catch(() => undefined);");
