@@ -43,8 +43,8 @@ Lock Screen, which the system draws from the app's layout and which a server can
    (`expo-widgets` hands it over through the activity's instance), so the app registers its activities every time it
    comes to the foreground and every 15 seconds while it is open, keeping one activity (a second one, from a start
    sent again before the first one's token arrived, ends). Until then the server cannot update that one activity;
-   a start goes stale after 10 minutes so the system dims it instead of showing old news as current, and the start is
-   sent again only after those 10 minutes. Signing out of a server removes the registration and ends the activities.
+   a start goes stale after 2 minutes, and the layout then shows no timer and no "working" but `stale` ("Abra o app para ver o status"), since the server cannot end it either and the work may be over, and the start is
+   sent again only after 10 minutes. Signing out of a server removes the registration and ends the activities.
 5. **The content** is the activity's `name` (`AgentsActivity`) and its `props`, a JSON string (the shape
    `expo-widgets` reads):
 
@@ -75,6 +75,8 @@ Lock Screen, which the system draws from the app's layout and which a server can
      more: number;
      /** Where a tap goes: agenteschat://island?org=…&channel=…[&thread=…][&message=…]. */
      url: string;
+     /** Shown in place of each step, without timers, once the content is out of date (iOS's `isStale`). */
+     stale?: string;
    }
    ```
 
