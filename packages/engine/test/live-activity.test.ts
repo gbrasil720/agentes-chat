@@ -155,7 +155,7 @@ describe("its words (ADR 0210 §5)", () => {
     expect(one).toEqual(expected.working);
     expect(liveActivityDoneProps(one, "pt-BR")).toEqual(expected.done);
     // Its keys, in the ADR's order.
-    expect(Object.keys(one ?? {})).toEqual(["v", "tone", "headline", "trailing", "agents", "more", "url"]);
+    expect(Object.keys(one ?? {})).toEqual(["v", "tone", "headline", "trailing", "agents", "more", "url", "stale"]);
     expect(Object.keys(one?.agents[0] ?? {})).toEqual(["id", "name", "face", "step", "since", "state", "where"]);
   });
 
@@ -313,7 +313,7 @@ describe("sending (job live-activity.refresh)", () => {
       event: "start",
       contentState: { name: "AgentsActivity" },
       timestamp: seconds(now),
-      staleDate: seconds(now) + 600,
+      staleDate: seconds(now) + 120,
       alert: { title: "Dev", body: "Trabalhando · #general" },
       attributesType: "LiveActivityAttributes",
       inputPushToken: true,

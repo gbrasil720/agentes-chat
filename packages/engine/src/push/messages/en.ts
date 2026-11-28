@@ -128,6 +128,8 @@ export interface PushStrings {
   liveActivityWorkingStep: string;
   liveActivityQueuedStep: string;
   liveActivityDone: string;
+  /** What a Live Activity says once out of date: no update reached it, so whether the work goes on is unknown. */
+  liveActivityStale: string;
 }
 
 export const en: PushStrings = {
@@ -251,4 +253,5 @@ export const en: PushStrings = {
   liveActivityWorkingStep: "Working",
   liveActivityQueuedStep: "In line",
   liveActivityDone: "Done",
+  liveActivityStale: "Open the app to see the latest",
 };

@@ -32,9 +32,13 @@ export const LIVE_ACTIVITY_SHOWN = 3;
 export const LIVE_ACTIVITY_UPDATE_EVERY_MS = 5000;
 /** A push-to-start whose activity never sent its token back is tried again only after this. */
 export const LIVE_ACTIVITY_RESTART_AFTER_MS = 10 * 60_000;
-/** A started activity's content is dimmed as out of date this long after (until its own token lets us update it). */
-export const LIVE_ACTIVITY_START_STALE_MS = 10 * 60_000;
-/** An update's content is dimmed this long after, unless sent again: a server that stopped never shows old news. */
+/**
+ * A started activity's content reads as out of date this long after (`stale`), until its own token lets us update it:
+ * the server can't end an activity whose token never came back, so a run that ended meanwhile must not keep showing
+ * at work with its timer running.
+ */
+export const LIVE_ACTIVITY_START_STALE_MS = 2 * 60_000;
+/** An update's content reads as out of date this long after, unless sent again: a server that stopped never shows old news. */
 export const LIVE_ACTIVITY_STALE_MS = 30 * 60_000;
 /** While nothing changes, the same content is sent again this often, so it never goes stale while it is right. */
 export const LIVE_ACTIVITY_RESEND_MS = 20 * 60_000;
@@ -101,6 +105,8 @@ export interface LiveActivityProps {
   }[];
   more: number;
   url: string;
+  /** Shown in place of each step, without timers, once the content is out of date (iOS's `isStale`). */
+  stale?: string;
 }
 
 // ── What it shows ────────────────────────────────────────────────────────────
@@ -436,6 +442,7 @@ export function liveActivityProps(
     })),
     more: count - shown.length,
     url: liveActivityUrl(first),
+    stale: s.liveActivityStale,
   };
 }
 

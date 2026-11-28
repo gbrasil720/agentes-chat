@@ -121,4 +121,5 @@ export const ptBR: PushStrings = {
   liveActivityWorkingStep: "Trabalhando",
   liveActivityQueuedStep: "Na fila",
   liveActivityDone: "Pronto",
+  liveActivityStale: "Abra o app para ver o status",
 };
